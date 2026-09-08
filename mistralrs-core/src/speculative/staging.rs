@@ -11,7 +11,12 @@ pub(crate) fn staged_batch_state(seqs: &[&mut Sequence]) -> StagedBatchState {
     staged_batch_state_from_widths(seqs.iter().map(|seq| seq.active_staged_speculative_len()))
 }
 
-fn staged_batch_state_from_widths(widths: impl IntoIterator<Item = usize>) -> StagedBatchState {
+// pub(crate), not private: also reused by inputs_processor.rs's pending-fast-forward-token
+// homogeneous-width check, which is the same "all-or-none across the batch" logic over a
+// different `Sequence` field. Purely a generic usize-width scan, no speculative-decoding state.
+pub(crate) fn staged_batch_state_from_widths(
+    widths: impl IntoIterator<Item = usize>,
+) -> StagedBatchState {
     let mut width = None;
     let mut saw_empty = false;
     for len in widths {

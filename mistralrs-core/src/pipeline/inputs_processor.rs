@@ -1522,6 +1522,19 @@ pub mod text_models_inputs_processor {
         Ok(Tensor::cat(&[&host, &staged], 1)?)
     }
 
+    /// Homogeneous-width check for `Sequence::pending_ff_tokens`, mirroring
+    /// `speculative::staging::staged_batch_width`: a batch mixing forced and non-forced
+    /// sequences, or forced sequences of differing splice length, falls back to `None` (no
+    /// widening for this step) rather than a ragged decode window.
+    fn pending_ff_batch_width(seqs: &[&mut Sequence]) -> Option<usize> {
+        match crate::speculative::staging::staged_batch_state_from_widths(
+            seqs.iter().map(|seq| seq.active_pending_ff_tokens().len()),
+        ) {
+            crate::speculative::staging::StagedBatchState::Homogeneous(width) => Some(width),
+            _ => None,
+        }
+    }
+
     fn make_completion_chunk<T: WithDType + From<u32> + Clone + std::fmt::Debug>(
         toks: Vec<&[T]>,
         input_seqs: &[&mut Sequence],
@@ -1555,6 +1568,9 @@ pub mod text_models_inputs_processor {
             && input_seqs
                 .iter()
                 .any(|seq| seq.active_staged_speculative_tokens().as_device().is_some());
+        // Grammar fast-forward tokens: same all-or-none homogeneous-width fallback as staged
+        // speculative tokens above, over a different (always host-side) `Sequence` field.
+        let use_pending_ff = pending_ff_batch_width(input_seqs).is_some();
         let sequence_block_tables = paged_attn_metadata.as_ref().map(|paged_attn_metadata| {
             let kv_mgr = get_mut_arcmutex!(paged_attn_metadata.kv_cache_manager);
             input_seqs
@@ -1569,6 +1585,7 @@ pub mod text_models_inputs_processor {
                 .collect::<Vec<_>>()
         });
         let mut host_input_width = None;
+        let mut full_query_lens = Vec::new();
         for (seq_idx, (seq, ctxt)) in input_seqs.iter().zip(toks).enumerate() {
             let staged_speculative = if use_staged_speculative && !use_device_staged {
                 seq.active_staged_speculative_tokens()
@@ -1577,9 +1594,21 @@ pub mod text_models_inputs_processor {
             } else {
                 &[]
             };
+            let pending_ff = if use_pending_ff {
+                seq.active_pending_ff_tokens()
+            } else {
+                &[]
+            };
+            if !pending_ff.is_empty() && seq.active_staged_speculative_len() > 0 {
+                anyhow::bail!(
+                    "sequence has both a staged speculative proposal and a pending grammar \
+                     fast-forward splice; these mechanisms are mutually exclusive"
+                );
+            }
             let start_pos = ctxt.len().saturating_sub(decode_window);
             let mut ctxt = ctxt[start_pos..].to_vec();
             ctxt.extend(staged_speculative.iter().copied().map(T::from));
+            ctxt.extend(pending_ff.iter().copied().map(T::from));
             let host_width = ctxt.len();
             let query_len = host_width
                 + if use_device_staged {
@@ -1587,9 +1616,22 @@ pub mod text_models_inputs_processor {
                 } else {
                     0
                 };
+            full_query_lens.push(query_len);
             let effective_context_len = start_pos + query_len;
             seqlen_offsets.push(start_pos);
-            context_lens.push((0, query_len));
+            // Forced tokens are already known -- only the position after them needs a sampled
+            // logit, so narrow the (otherwise full-window) hidden-state selection to it instead
+            // of paying lm_head's vocab projection for every forced position. Staged speculative
+            // proposals need every position's logits for verification, so never narrow when a
+            // speculative proposal is active on this sequence (the bail above already rules out
+            // both being active at once; this repeats the check on the raw per-sequence state
+            // rather than relying on that being the only path here).
+            let narrow_for_ff = !pending_ff.is_empty() && seq.active_staged_speculative_len() == 0;
+            context_lens.push(if narrow_for_ff {
+                (query_len - 1, 1)
+            } else {
+                (0, query_len)
+            });
             position_ids.push(effective_context_len);
 
             if flash_attn {
@@ -1663,8 +1705,10 @@ pub mod text_models_inputs_processor {
             }
         }
 
+        // Full window width, not the (possibly fast-forward-narrowed) logit-selection width in
+        // `context_lens` -- a forced multi-token window still needs real flash-attn metadata.
         let paged_single_token_decode = paged_attn_metadata.is_some()
-            && context_lens.iter().all(|&(_, query_len)| query_len == 1);
+            && full_query_lens.iter().all(|&query_len| query_len == 1);
         let flash_meta = if flash_attn && !paged_single_token_decode {
             make_flash_params(
                 device,
@@ -1680,7 +1724,9 @@ pub mod text_models_inputs_processor {
         };
 
         let paged_attn_meta = if let Some(paged_attn_input) = &paged_attn_metadata {
-            let query_len = context_lens.first().map_or(1, |(_, q)| *q);
+            // Full window width -- KV-cache slot mapping needs every position that was actually
+            // computed, independent of how much of it `context_lens` selects logits for above.
+            let query_len = full_query_lens.first().copied().unwrap_or(1);
             let block_tables = BlockTableSnapshot::from_sequence_tables(
                 sequence_block_tables.expect("paged block tables were snapshotted"),
                 query_len,
