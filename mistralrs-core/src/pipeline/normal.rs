@@ -286,6 +286,10 @@ pub(crate) fn build_normal_pipeline(
                 output: vec![SupportedModality::Text],
             },
             loaded_for_uqff_write,
+            // Mechanism validated correct (byte-identical output vs. unpatched decode). Off by
+            // default; opt in via MISTRALRS_GRAMMAR_FAST_FORWARD=1 once you've measured it's a
+            // win for your own grammar shape and hardware.
+            supports_grammar_fast_forward: crate::perf_flags::grammar_fast_forward_enabled(),
         }),
         #[cfg(feature = "cuda")]
         cuda_decode_graph: StdMutex::new(CudaDecodeGraphState::default()),

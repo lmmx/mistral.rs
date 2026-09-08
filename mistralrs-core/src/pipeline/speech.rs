@@ -327,6 +327,7 @@ impl Loader for SpeechLoader {
                     output: vec![SupportedModality::Audio],
                 },
                 loaded_for_uqff_write: false,
+                supports_grammar_fast_forward: false,
             }),
             dummy_cache: EitherCache::Full(Cache::new(0, false)),
             cfg: self

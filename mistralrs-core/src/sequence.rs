@@ -782,6 +782,11 @@ pub struct Sequence {
     staged_speculative_tokens: SpeculativeTokens,
     staged_speculative_distribution: Option<SpeculativeProposalDistribution>,
 
+    // Grammar fast-forward: tokens the active llguidance matcher has already committed to
+    // (Matcher::consume_ff_tokens), staged for the next decode window. Unlike staged speculative
+    // tokens these are grammar-certain, not a draft proposal, so there's no distribution to verify.
+    pending_ff_tokens: Vec<u32>,
+
     // Prefix caching
     prefill_prompt_toks: Option<PrefillTokens>,
     /// Number of tokens at the start of the prompt that are cached (KV already computed).
@@ -949,6 +954,7 @@ impl Sequence {
             last_is_done: None,
             staged_speculative_tokens: SpeculativeTokens::default(),
             staged_speculative_distribution: None,
+            pending_ff_tokens: Vec::new(),
             scheduling_urgency: 0,
             // Multimodal data
             multimodal: MultimodalData::new(
@@ -1237,6 +1243,18 @@ impl Sequence {
     pub(crate) fn clear_staged_speculative_tokens(&mut self) {
         self.staged_speculative_tokens = SpeculativeTokens::default();
         self.staged_speculative_distribution = None;
+    }
+
+    pub(crate) fn active_pending_ff_tokens(&self) -> &[u32] {
+        &self.pending_ff_tokens
+    }
+
+    pub(crate) fn set_pending_ff_tokens(&mut self, tokens: Vec<u32>) {
+        self.pending_ff_tokens = tokens;
+    }
+
+    pub(crate) fn take_pending_ff_tokens(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.pending_ff_tokens)
     }
 
     pub fn get_initial_prompt(&self) -> &str {
