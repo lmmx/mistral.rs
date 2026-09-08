@@ -898,6 +898,8 @@ pub(crate) async fn finish_verified_step<P: Pipeline>(
                         false,
                         false,
                         false,
+                        // Verification has its own propose/verify windowing; not fast-forward.
+                        false,
                     )
                     .await?,
                     None,
@@ -961,6 +963,8 @@ pub(crate) async fn finish_verified_step<P: Pipeline>(
                 rng.clone(),
                 false,
                 false,
+                false,
+                // Verification has its own propose/verify windowing; not fast-forward.
                 false,
             )
             .await?

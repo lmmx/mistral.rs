@@ -286,6 +286,9 @@ where
             use_async_pool,
             false,
             use_async_pool,
+            // Speculative decoding already runs its own windowed propose/verify loop; grammar
+            // fast-forward tokens are a separate mechanism this driver doesn't stage or replay.
+            false,
         )
         .await?;
         let sampled_token = anchor.token;

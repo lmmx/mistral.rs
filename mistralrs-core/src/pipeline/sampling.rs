@@ -717,6 +717,35 @@ pub(crate) async fn finalize_block_gen(
     Ok(())
 }
 
+/// Replays a grammar-forced token splice (`Sequence::pending_ff_tokens`) through the normal
+/// per-token completion path, one token at a time -- same shape as `finalize_block_gen` above,
+/// for a single sequence's already-known splice instead of a per-seq diffusion block. The only
+/// difference from a sampled token is these skip the forward pass, since the grammar already
+/// determined them (see the `consume_ff_tokens` call in `sample_sequence`). Returns `true` if the
+/// sequence reached a `Done` state partway through the splice, in which case the caller must not
+/// go on to apply the token sampled after it.
+async fn apply_pending_ff_tokens(
+    this: &dyn Pipeline,
+    prefix_cacher: &mut PrefixCacheManagerV2,
+    seq: &mut Sequence,
+    pending_ff: Vec<u32>,
+    eos_tok: Option<&[u32]>,
+) -> Result<bool> {
+    for token in pending_ff {
+        if !seq.is_running() {
+            break;
+        }
+        let logprobs = Logprobs {
+            token,
+            logprob: 0.0,
+            bytes: None,
+            top_logprobs: None,
+        };
+        finish_or_add_toks_to_seq(this, prefix_cacher, seq, logprobs, eos_tok, true).await?;
+    }
+    Ok(!seq.is_running())
+}
+
 pub async fn sample_and_add_toks(
     this: &dyn Pipeline,
     seqs: &mut [&mut Sequence],
@@ -796,6 +825,15 @@ async fn sample_and_add_toks_inner(
     let llg_factory = metadata.llg_factory.clone();
     let max_model_len = metadata.max_seq_len;
     let eos_toks = metadata.eos_tok.clone();
+    let supports_fast_forward = metadata.supports_grammar_fast_forward;
+
+    // The window this step decoded may have included a previously staged fast-forward splice
+    // (see `sample_sequence`'s `consume_ff_tokens` call). Captured here, before `sample_sequence`
+    // runs below and stages a *new* splice for the following step onto the same field.
+    let pending_ff_toks: Vec<Vec<u32>> = seqs
+        .iter_mut()
+        .map(|seq| seq.take_pending_ff_tokens())
+        .collect();
 
     let sampled_vec = match try_sample_batch_cuda(&logits, seqs, &rng)? {
         Some(sampled) => sampled,
@@ -816,6 +854,7 @@ async fn sample_and_add_toks_inner(
                         use_async_pool,
                         false,
                         use_async_pool,
+                        supports_fast_forward,
                     )
                 })
                 .collect();
@@ -823,11 +862,20 @@ async fn sample_and_add_toks_inner(
         }
     };
 
-    for (sampled, seq) in std::iter::zip(sampled_vec, seqs.iter_mut()) {
-        let next_token = crate::handle_seq_error_stateaware_ok!(sampled, seq);
-
+    for ((sampled, seq), ff_toks) in std::iter::zip(
+        std::iter::zip(sampled_vec, seqs.iter_mut()),
+        pending_ff_toks,
+    ) {
         let metadata = this.get_metadata();
         let eos_tok = seq.effective_eos_tokens(&metadata.eos_tok, disable_eos_stop);
+
+        if !ff_toks.is_empty()
+            && apply_pending_ff_tokens(this, prefix_cacher, seq, ff_toks, eos_tok).await?
+        {
+            continue;
+        }
+
+        let next_token = crate::handle_seq_error_stateaware_ok!(sampled, seq);
 
         finish_or_add_toks_to_seq(this, prefix_cacher, seq, next_token, eos_tok, true).await?;
     }
@@ -1389,6 +1437,7 @@ pub async fn sample_sequence(
     use_async_pool: bool,
     sample_speculative: bool,
     multiple_sequences: bool,
+    supports_fast_forward: bool,
 ) -> Result<Logprobs> {
     activate_required_tool_call_grammar(seq, llg_factory.as_ref(), max_model_len, false);
     let rng = seq.sampling_rng(&rng);
@@ -1516,6 +1565,18 @@ pub async fn sample_sequence(
             if !llg.is_stopped() && !ends_turn {
                 llg.consume_token(second_logprobs_response.token)
                     .map_err(candle_core::Error::msg)?;
+                // The matcher may now have a single legal continuation for the next several
+                // tokens (e.g. the rest of a forced tool-call scaffold). Stage it so the next
+                // decode window can feed these back in without a forward pass each -- only for
+                // pipelines whose input builder actually consumes `pending_ff_tokens`; see
+                // `GeneralMetadata::supports_grammar_fast_forward`.
+                if supports_fast_forward && !llg.is_stopped() {
+                    let splice = llg.consume_ff_tokens();
+                    if !splice.is_empty() {
+                        tracing::debug!(splice_len = splice.len(), "fast-forward splice computed");
+                        seq.set_pending_ff_tokens(splice);
+                    }
+                }
             }
         }
         SequenceRecognizer::None => {}
@@ -1678,7 +1739,7 @@ mod tests {
         )
         .unwrap();
         sample_sequence(
-            logits, seq, false, None, None, 1024, fallback, false, false, false,
+            logits, seq, false, None, None, 1024, fallback, false, false, false, false,
         )
         .await
         .unwrap()
