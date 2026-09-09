@@ -1313,9 +1313,9 @@ pub struct GeneralMetadata {
     // UQFF writes force the whole model onto CPU, so the pipeline is not servable afterwards.
     pub loaded_for_uqff_write: bool,
     // Whether this pipeline's decode step feeds `Sequence::pending_ff_tokens` (grammar
-    // fast-forward splices) through the windowed decode path. Vision/embedding/diffusion/speech
-    // pipelines build their own inputs and never consume that field, so leaving this false there
-    // is a correctness requirement, not just an optimization opt-out.
+    // fast-forward splices) through the windowed decode path. Only meaningful when the
+    // pipeline's inputs processor is `TextInputsProcessor`; a pipeline wired to any other
+    // processor never reads that field, so it stays false there.
     pub supports_grammar_fast_forward: bool,
 }
 
