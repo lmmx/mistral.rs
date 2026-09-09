@@ -220,3 +220,31 @@ implementing session, not from the reviewing session.
   measured per grammar shape and hardware; `resolve_pending_ff_batch` discards every splice on a
   batch that is not `StagedBatchState::Homogeneous`, so a multi-sequence grammar batch reaches the
   same token count and the same output as with the flag unset (inputs_processor.rs:1547-1558).
+
+---
+
+## Resolved
+
+Commit `3b37de65e` on `grammar-fast-forward` closes Tasks 1, 2 and 3. The "Not a task" section and
+the `Divergence` section below it still hold.
+
+- Task 1 closes through `apply_pending_ff_tokens` decoding each replayed token with
+  `tok_env.tok_trie().decode_ext(&[token], include_special)` and setting both `Logprobs::bytes` and
+  `TopLogprob::bytes` to the decoded string (sampling.rs:752, 757, 762), matching what
+  `finish_or_add_toks_to_seq` derives for a sampled token.
+- Task 2 closes through `Sequence::discard_pending_ff_tokens` calling
+  `set_state(SequenceState::Error)` when `Matcher::rollback` returns `Err` (sequence.rs:1284), with
+  the unreachability argument recorded in the branch rather than the branch removed.
+- Task 3 closes through three tests rather than two:
+  `resolve_pending_ff_batch_discards_mismatched_splice_widths` and
+  `resolve_pending_ff_batch_keeps_equal_width_splices` over a local `ff_test_sequence` fixture
+  (inputs_processor.rs:3235, 3294, 3307), and
+  `completion_batches_reserve_slots_for_pending_fast_forward_splices` asserting on
+  `get_block_ids` rather than on the reservation arithmetic
+  (paged_attention/scheduler.rs:4120).
+- The `Matcher::rollback` half of `Sequence::discard_pending_ff_tokens` stays uncovered, as stated
+  under Task 3.
+- The flag's doc comment (normal.rs:289) states that a multi-sequence grammar-constrained batch
+  ordinarily feeds no splice, which closes the `Divergence` entry below.
+- No `cargo` invocation completes in the review container, so build and test status for
+  `3b37de65e` comes from the implementing session.
