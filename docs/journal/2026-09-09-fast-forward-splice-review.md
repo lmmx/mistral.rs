@@ -333,3 +333,44 @@ carrying different grammars exposes Defect 1, and enabling PagedAttention expose
 - `RESULTS.md` reports "~6.1-6.2x faster" for the flag-on configuration; the measured grammar
   forces 100% of the completion, and `RESULTS.md` records the separate sumac measurement of ~3% for
   a tool-call grammar forcing only scaffold tokens (branch `ff-demo-artifacts`, `RESULTS.md`).
+
+---
+
+## Resolution
+
+Commit `49848e501` on `grammar-fast-forward` closes all five defects.
+
+- Defect 1 closes through `resolve_pending_ff_batch` (inputs_processor.rs:1547), called once per
+  completion step from `TextInputsProcessor::process_inputs` under `if !is_prompt`
+  (inputs_processor.rs:2669) and ahead of both `get_completion_input` call sites
+  (inputs_processor.rs:2685, 2834). `resolve_pending_ff_batch` re-derives the same
+  `staged_batch_state_from_widths` verdict that `pending_ff_batch_width` applies downstream
+  (inputs_processor.rs:1595) and discards every splice in the batch on `StagedBatchState::Mixed`
+  and `StagedBatchState::None`, so after `resolve_pending_ff_batch` returns the batch is either
+  all-empty or homogeneous and the two sites agree by construction.
+- `Sequence::discard_pending_ff_tokens` (sequence.rs:1265) drops a splice and calls
+  `Matcher::rollback(splice.len())`, and `TokenParser::rollback`
+  (llguidance-1.4.0 tokenparser.rs:381-418) restores `llm_tokens`, `llm_bytes` and
+  `max_tokens_total`, clears a `StopReason` that is not an error, and clears the parser caches.
+- Defect 2 closes through `active_pending_ff_tokens().len()` added to
+  `PagedAttentionScheduler::completion_token_cost` (paged_attention/scheduler.rs:543) and to the
+  `allocate_slots` call site as a `seq_guard.len() + pending_ff` branch
+  (paged_attention/scheduler.rs:1188-1192), which matches the `L + K` slot count that a window
+  spanning block positions `L-1` through `L+K-1` writes, and through
+  `Sequence::discard_pending_ff_tokens` in `PagedAttentionScheduler::_preempt`
+  (paged_attention/scheduler.rs:1388).
+- `DefaultScheduler` moves no running sequence to `SequenceState::Waiting` outside its own tests
+  (scheduler/default_scheduler.rs:527), so `DefaultScheduler` carries no counterpart to the
+  `PagedAttentionScheduler::_preempt` gap.
+- Defect 3 closes through a replay pass over every sequence ahead of sampling in
+  `sample_and_add_toks_inner` (sampling.rs:844-855), recording completions in `finished_mask` and
+  sampling only the sequences the replay left running (sampling.rs:858-863, 904-908).
+- Defect 4 closes through the `!llg.is_error()` test guarding `set_pending_ff_tokens`
+  (sampling.rs:1631), using `Matcher::is_error` and `Matcher::get_error`
+  (llguidance-1.4.0 matcher.rs:183, 187).
+- Defect 5 is a panic rather than a response-shape difference: `finish_or_add_toks_to_seq`
+  evaluates `logprob.top_logprobs.clone().unwrap()` for every token recorded on a sequence that
+  reaches a Done state under `seq.return_logprobs()` (sampling.rs:511, 527), so a `None` on a
+  replayed token aborts the completion. Defect 5 closes through the single-entry `TopLogprob`
+  vector that `apply_pending_ff_tokens` builds when `seq.return_logprobs()` holds
+  (sampling.rs:746-752).
