@@ -4117,6 +4117,35 @@ mod tests {
     }
 
     #[test]
+    fn completion_batches_reserve_slots_for_pending_fast_forward_splices() {
+        // block_size is 8 (test_scheduler); a 4-token sequence with no splice needs 1 block
+        // (len + 1 for the next sampled token = 5). A 5-token splice pushes the window to 9
+        // tokens, crossing into a second block -- this only happens if `schedule` reserves for
+        // `active_pending_ff_tokens().len()` rather than falling through to the `len() + 1`
+        // default once `num_uncomputed_tokens() == 0`.
+        let mut scheduler = test_scheduler();
+        let seq = test_sequence(0, 4);
+        {
+            let mut seq_guard = get_mut_arcmutex!(seq);
+            seq_guard.set_num_computed_tokens(4);
+            seq_guard.set_pending_ff_tokens(vec![10, 11, 12, 13, 14]);
+        }
+        scheduler.running.push_back(seq);
+
+        let logger = IntervalLogger::new(std::time::Duration::from_secs(3600), None);
+        let scheduled = scheduler.schedule(&logger, None);
+        let scheduled_ids = scheduled
+            .scheduled
+            .iter()
+            .map(|seq| *get_mut_arcmutex!(seq).id())
+            .collect::<Vec<_>>();
+        assert_eq!(scheduled_ids, vec![0]);
+
+        let kv_mgr = get_mut_arcmutex!(scheduler.kv_cache_manager);
+        assert_eq!(kv_mgr.get_block_ids(0).unwrap().len(), 2);
+    }
+
+    #[test]
     fn resident_decode_continuation_requires_exact_live_batch() {
         let mut scheduler = test_scheduler();
         scheduler.running.push_back(test_sequence(0, 4));

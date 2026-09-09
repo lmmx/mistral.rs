@@ -292,7 +292,11 @@ pub(crate) fn build_normal_pipeline(
             // under greedy sampling with a fully-forcing regex, a configuration that couldn't
             // exercise mixed-width batching, PagedAttention slot accounting, or sampling-penalty
             // ordering -- those paths have since been reviewed and fixed, but not re-validated
-            // end to end.
+            // end to end. A splice only reaches the decode window when every sequence in the
+            // batch is staging one of the same length; a batch of two or more grammar-constrained
+            // sequences is ordinarily not, since splice length tracks each sequence's own grammar
+            // position, so multi-sequence throughput on this flag is currently close to the
+            // flag-off baseline (see `mistralrs_grammar_ff_splice_drops_total`).
             supports_grammar_fast_forward: crate::perf_flags::grammar_fast_forward_enabled(),
         }),
         #[cfg(feature = "cuda")]

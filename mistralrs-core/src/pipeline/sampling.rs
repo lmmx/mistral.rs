@@ -735,19 +735,31 @@ async fn apply_pending_ff_tokens(
     // `top_logprobs`; `finish_or_add_toks_to_seq`'s Done-state handling unwraps it
     // unconditionally. A forced token has exactly one candidate (itself, at probability 1).
     let return_logprobs = seq.return_logprobs();
+    // Decode each token's text up front, the same way `finish_or_add_toks_to_seq` derives
+    // `completion_bytes` one line after it receives this `Logprobs`, so a replayed token's
+    // `bytes` matches a sampled token's shape instead of going out as `None`.
+    let tok_env = this
+        .get_metadata()
+        .tok_env()
+        .ok_or(candle_core::Error::Msg(
+            "`apply_pending_ff_tokens` requires the pipeline to have a token trie".to_string(),
+        ))?;
+    let include_special = seq.tool_call_state.is_some() || seq.needs_special_tokens();
     for token in pending_ff {
         if !seq.is_running() {
             break;
         }
+        let decoded = tok_env.tok_trie().decode_ext(&[token], include_special);
+        let bytes = String::from_utf8_lossy(&decoded).into_owned();
         let logprobs = Logprobs {
             token,
             logprob: 0.0,
-            bytes: None,
+            bytes: Some(bytes.clone()),
             top_logprobs: return_logprobs.then(|| {
                 vec![TopLogprob {
                     token,
                     logprob: 0.0,
-                    bytes: None,
+                    bytes: Some(bytes),
                 }]
             }),
         };
