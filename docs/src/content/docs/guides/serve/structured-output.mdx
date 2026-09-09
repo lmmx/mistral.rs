@@ -165,6 +165,18 @@ let request = RequestBuilder::new()
 
 Full examples: [regex](/examples/server/regex/), [lark](/examples/server/lark/), [llguidance](/examples/server/llguidance/) (HTTP); [regex](/examples/python/regex/), [lark_llg](/examples/python/lark-llg/) (Python); [grammar](/examples/rust/advanced/grammar/), [llguidance](/examples/rust/advanced/llguidance/) (Rust).
 
+### Grammar fast-forward
+
+When a grammar leaves only one legal continuation for the next several tokens -- the rest of a forced literal, the closing brace and comma of a tool-call scaffold -- llguidance hands back the whole span at once instead of one token at a time. Grammar fast-forward feeds that span into the next decode window as already-known tokens, so those positions cost one forward pass together instead of one each.
+
+The payoff depends entirely on how much of your grammar is forced. Long forced literal spans and closing scaffolding around tool calls benefit the most; a mostly-freeform grammar (a loose regex, a schema with few required literal fields) rarely has more than one legal next token in a row, so there is little for the mechanism to find.
+
+Off by default; set `MISTRALRS_GRAMMAR_FAST_FORWARD=1` to enable it once you've checked it helps for your own grammar shape and hardware -- see the [environment variables reference](/reference/environment-variables/#server-and-ui).
+
+A span is fed only when every sequence running in that step has staged one of the same length. Span length tracks each request's own position in its own grammar, so two concurrent grammar-constrained requests ordinarily agree on nothing, and the batch falls back to the flag-off baseline for that step. Watch [`mistralrs_grammar_ff_splice_drops_total{reason="batch_shape"}`](/guides/deploy/observability/#grammar-fast-forward) to see how often this happens under your traffic.
+
+Requires a KV cache (no effect under `--no-kv-cache`) and is not available under X-LoRA or for multimodal pipelines.
+
 ## Notes
 
 - `response_format` accepts `{"type": "text"}` (no constraint) and `{"type": "json_schema", ...}`. OpenAI's `json_object` mode is not accepted; supply a schema instead. See [OpenAI compatibility](/reference/openai-compatibility/) for field-level deviations.

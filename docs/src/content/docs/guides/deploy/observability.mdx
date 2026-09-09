@@ -115,6 +115,16 @@ These metrics are only populated when a model with a speculative proposer (MTP) 
 | `mistralrs_speculative_staged_drops_total` | counter | - | Staged proposals discarded without verification (preemption, batch-shape mismatch, or a step that cannot verify). |
 | `mistralrs_paged_preemptions_total` | counter | - | Running sequences preempted and returned to the waiting queue (paged attention). |
 
+### Grammar fast-forward
+
+These metrics are populated only when [grammar fast-forward](/guides/serve/structured-output/#grammar-fast-forward) is enabled (`MISTRALRS_GRAMMAR_FAST_FORWARD=1`) and a request carries a grammar.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `mistralrs_grammar_ff_splices_staged_total` | counter | - | Forced multi-token spans staged by the grammar matcher. |
+| `mistralrs_grammar_ff_tokens_fed_total` | counter | - | Staged tokens actually fed into a decode window. Also the number of decode forward passes skipped, which is the feature's payoff. |
+| `mistralrs_grammar_ff_splice_drops_total` | counter | `reason` | Staged spans discarded before they reached a decode window. `reason` is `batch_shape` (another sequence in the same step staged a span of a different length, or none at all), `preemption` (the sequence was preempted before its span was fed), or `realloc` (the sequence's token list was rebuilt, invalidating the staged span). |
+
 ### Useful PromQL
 
 Acceptance is a ratio of cumulative counters, so rates and quantiles belong in PromQL rather than extra gauges:
@@ -141,6 +151,10 @@ mistralrs_kv_cache_blocks_used / mistralrs_kv_cache_blocks_total
 
 # Sequence capacity utilization (sustained 1.0 with a growing waiting queue means requests are queueing)
 mistralrs_sequences_running / mistralrs_sequences_capacity
+
+# Fraction of staged grammar fast-forward spans dropped before reaching a decode window
+sum(rate(mistralrs_grammar_ff_splice_drops_total[5m]))
+  / sum(rate(mistralrs_grammar_ff_splices_staged_total[5m]))
 ```
 
 If you want gauge-like ergonomics for the acceptance rate, use a recording rule instead of a server-side percentile gauge:

@@ -64,6 +64,8 @@ The default differs by surface:
 
 More running sequences need more KV cache. With paged attention, size the block pool to match: one of `--pa-context-len`, `--pa-memory-mb`, or `--pa-memory-fraction` (default: 90% of available VRAM). If the pool runs out of blocks mid-generation, the scheduler preempts a running sequence, frees its blocks, and requeues it, which costs recomputation.
 
+If you enable [grammar fast-forward](/guides/serve/structured-output/#grammar-fast-forward), be aware it currently sees close to the flag-off baseline under concurrent grammar-constrained load; higher `--max-seqs` does not help it the way it helps everything else in this section.
+
 ## Mixed prefill and decode
 
 Three limits control how new prompts share the GPU with active decodes:

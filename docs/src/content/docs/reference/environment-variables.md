@@ -61,6 +61,7 @@ See [CPU threads and affinity](/guides/perf/throughput-tuning/#cpu-threads-and-a
 | `MISTRALRS_LORA_ADAPTER_ROOT` | Canonical directory root allowed for runtime LoRA adapter paths. Use this whenever runtime LoRA updating is enabled in production. |
 | `XDG_CACHE_HOME` | Base cache directory for web UI state. The UI uses `$XDG_CACHE_HOME/mistralrs`. |
 | `HOME` | Fallback for web UI cache path when `XDG_CACHE_HOME` is not set. |
+| `MISTRALRS_GRAMMAR_FAST_FORWARD` | Set to `1`, `true`, `yes`, or `on` to enable grammar fast-forward: forced multi-token spans from a grammar-constrained request are fed into the next decode window instead of costing one forward pass each. Off by default. Applies only to grammar-constrained requests; has no effect under `--no-kv-cache` or with X-LoRA adapters. Concurrent grammar-constrained requests currently see close to the flag-off baseline. See [grammar fast-forward](/guides/serve/structured-output/#grammar-fast-forward). |
 
 ## CUDA acceleration
 
