@@ -286,9 +286,13 @@ pub(crate) fn build_normal_pipeline(
                 output: vec![SupportedModality::Text],
             },
             loaded_for_uqff_write,
-            // Mechanism validated correct (byte-identical output vs. unpatched decode). Off by
-            // default; opt in via MISTRALRS_GRAMMAR_FAST_FORWARD=1 once you've measured it's a
-            // win for your own grammar shape and hardware.
+            // Off by default; opt in via MISTRALRS_GRAMMAR_FAST_FORWARD=1 once you've measured
+            // it's a win for your own grammar shape and hardware. The only prior validation
+            // (byte-identical output vs. unpatched decode) ran a single sequential CPU request
+            // under greedy sampling with a fully-forcing regex, a configuration that couldn't
+            // exercise mixed-width batching, PagedAttention slot accounting, or sampling-penalty
+            // ordering -- those paths have since been reviewed and fixed, but not re-validated
+            // end to end.
             supports_grammar_fast_forward: crate::perf_flags::grammar_fast_forward_enabled(),
         }),
         #[cfg(feature = "cuda")]

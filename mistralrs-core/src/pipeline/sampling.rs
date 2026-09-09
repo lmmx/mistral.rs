@@ -12,7 +12,7 @@ use crate::sampler::{
 };
 use crate::{
     prefix_cacher::PrefixCacheManagerV2,
-    sampler::Logprobs,
+    sampler::{Logprobs, TopLogprob},
     sequence::{Sequence, SequenceRecognizer, SequenceState, StopReason, StreamingEmission},
     tools::ToolCallState,
 };
@@ -731,6 +731,10 @@ async fn apply_pending_ff_tokens(
     pending_ff: Vec<u32>,
     eos_tok: Option<&[u32]>,
 ) -> Result<bool> {
+    // A request with `return_logprobs` set expects every recorded token to carry
+    // `top_logprobs`; `finish_or_add_toks_to_seq`'s Done-state handling unwraps it
+    // unconditionally. A forced token has exactly one candidate (itself, at probability 1).
+    let return_logprobs = seq.return_logprobs();
     for token in pending_ff {
         if !seq.is_running() {
             break;
@@ -739,7 +743,13 @@ async fn apply_pending_ff_tokens(
             token,
             logprob: 0.0,
             bytes: None,
-            top_logprobs: None,
+            top_logprobs: return_logprobs.then(|| {
+                vec![TopLogprob {
+                    token,
+                    logprob: 0.0,
+                    bytes: None,
+                }]
+            }),
         };
         finish_or_add_toks_to_seq(this, prefix_cacher, seq, logprobs, eos_tok, true).await?;
     }
@@ -820,63 +830,106 @@ async fn sample_and_add_toks_inner(
     let seqs_len = seqs.len();
     debug_assert_eq!(logits.len()?, seqs_len);
 
-    let use_async_pool = seqs_len > 1;
     let metadata = this.get_metadata();
     let llg_factory = metadata.llg_factory.clone();
     let max_model_len = metadata.max_seq_len;
     let eos_toks = metadata.eos_tok.clone();
     let supports_fast_forward = metadata.supports_grammar_fast_forward;
 
-    // The window this step decoded may have included a previously staged fast-forward splice
-    // (see `sample_sequence`'s `consume_ff_tokens` call). Captured here, before `sample_sequence`
-    // runs below and stages a *new* splice for the following step onto the same field.
-    let pending_ff_toks: Vec<Vec<u32>> = seqs
-        .iter_mut()
-        .map(|seq| seq.take_pending_ff_tokens())
-        .collect();
-
-    let sampled_vec = match try_sample_batch_cuda(&logits, seqs, &rng)? {
-        Some(sampled) => sampled,
-        None => {
-            let logits_seq = logits.into_cpu_rows()?;
-            let sampling_futures: Vec<_> = std::iter::zip(logits_seq, seqs.iter_mut())
-                .map(|(logits_per_seq, seq)| {
-                    let return_logprobs = seq.return_logprobs();
-                    let eos_tok = seq.effective_eos_tokens(&eos_toks, disable_eos_stop);
-                    sample_sequence(
-                        logits_per_seq,
-                        seq,
-                        return_logprobs,
-                        eos_tok,
-                        llg_factory.clone(),
-                        max_model_len,
-                        rng.clone(),
-                        use_async_pool,
-                        false,
-                        use_async_pool,
-                        supports_fast_forward,
-                    )
-                })
-                .collect();
-            futures::future::join_all(sampling_futures).await
-        }
-    };
-
-    for ((sampled, seq), ff_toks) in std::iter::zip(
-        std::iter::zip(sampled_vec, seqs.iter_mut()),
-        pending_ff_toks,
-    ) {
-        let metadata = this.get_metadata();
-        let eos_tok = seq.effective_eos_tokens(&metadata.eos_tok, disable_eos_stop);
-
-        if !ff_toks.is_empty()
-            && apply_pending_ff_tokens(this, prefix_cacher, seq, ff_toks, eos_tok).await?
-        {
+    // Replay each sequence's staged fast-forward splice (see `sample_sequence`'s
+    // `consume_ff_tokens` call) before sampling below, not after: the penalty context and
+    // `generated_len()` that sampling reads must include the tokens this window already decoded,
+    // and a sequence the replay finishes must not reach `sample_sequence` at all -- it would
+    // otherwise advance the llguidance matcher and stage a new splice for a non-running sequence.
+    let mut finished_mask = vec![false; seqs_len];
+    let mut any_finished = false;
+    for (idx, seq) in seqs.iter_mut().enumerate() {
+        let ff_toks = seq.take_pending_ff_tokens();
+        if ff_toks.is_empty() {
             continue;
         }
+        let eos_tok = seq.effective_eos_tokens(&eos_toks, disable_eos_stop);
+        if apply_pending_ff_tokens(this, prefix_cacher, seq, ff_toks, eos_tok).await? {
+            finished_mask[idx] = true;
+            any_finished = true;
+        }
+    }
 
+    let mut running_seqs: Vec<&mut Sequence> = seqs
+        .iter_mut()
+        .enumerate()
+        .filter(|(idx, _)| !finished_mask[*idx])
+        .map(|(_, seq)| &mut **seq)
+        .collect();
+    if running_seqs.is_empty() {
+        return Ok(());
+    }
+    let use_async_pool = running_seqs.len() > 1;
+
+    let sampled_vec = if !any_finished {
+        // Common case: nothing was replayed to completion this step, so every original sequence
+        // is still running and the CUDA batched-sampling fast path stays available.
+        match try_sample_batch_cuda(&logits, &running_seqs, &rng)? {
+            Some(sampled) => sampled,
+            None => {
+                let logits_seq = logits.into_cpu_rows()?;
+                let sampling_futures: Vec<_> = std::iter::zip(logits_seq, running_seqs.iter_mut())
+                    .map(|(logits_per_seq, seq)| {
+                        let return_logprobs = seq.return_logprobs();
+                        let eos_tok = seq.effective_eos_tokens(&eos_toks, disable_eos_stop);
+                        sample_sequence(
+                            logits_per_seq,
+                            seq,
+                            return_logprobs,
+                            eos_tok,
+                            llg_factory.clone(),
+                            max_model_len,
+                            rng.clone(),
+                            use_async_pool,
+                            false,
+                            use_async_pool,
+                            supports_fast_forward,
+                        )
+                    })
+                    .collect();
+                futures::future::join_all(sampling_futures).await
+            }
+        }
+    } else {
+        // A splice finished at least one sequence this step: sample only the sequences still
+        // running, using their logits rows. Rare enough (only when a grammar-forced splice lands
+        // exactly on a stop condition) that skipping the CUDA batched path here isn't worth the
+        // extra row-selection bookkeeping.
+        let all_rows = logits.into_cpu_rows()?;
+        let running_rows: Vec<_> = std::iter::zip(all_rows, finished_mask.iter())
+            .filter(|(_, &finished)| !finished)
+            .map(|(row, _)| row)
+            .collect();
+        let sampling_futures: Vec<_> = std::iter::zip(running_rows, running_seqs.iter_mut())
+            .map(|(logits_per_seq, seq)| {
+                let return_logprobs = seq.return_logprobs();
+                let eos_tok = seq.effective_eos_tokens(&eos_toks, disable_eos_stop);
+                sample_sequence(
+                    logits_per_seq,
+                    seq,
+                    return_logprobs,
+                    eos_tok,
+                    llg_factory.clone(),
+                    max_model_len,
+                    rng.clone(),
+                    use_async_pool,
+                    false,
+                    use_async_pool,
+                    supports_fast_forward,
+                )
+            })
+            .collect();
+        futures::future::join_all(sampling_futures).await
+    };
+
+    for (sampled, seq) in std::iter::zip(sampled_vec, running_seqs.iter_mut()) {
+        let eos_tok = seq.effective_eos_tokens(&eos_toks, disable_eos_stop);
         let next_token = crate::handle_seq_error_stateaware_ok!(sampled, seq);
-
         finish_or_add_toks_to_seq(this, prefix_cacher, seq, next_token, eos_tok, true).await?;
     }
 
@@ -1572,9 +1625,17 @@ pub async fn sample_sequence(
                 // `GeneralMetadata::supports_grammar_fast_forward`.
                 if supports_fast_forward && !llg.is_stopped() {
                     let splice = llg.consume_ff_tokens();
-                    if !splice.is_empty() {
+                    // `consume_ff_tokens` discards the `Result` of its internal `consume_tokens`
+                    // call, so a splice it returns may have left the matcher in an error state.
+                    // Staging it anyway would commit tokens the matcher never actually accepted.
+                    if !splice.is_empty() && !llg.is_error() {
                         tracing::debug!(splice_len = splice.len(), "fast-forward splice computed");
                         seq.set_pending_ff_tokens(splice);
+                    } else if llg.is_error() {
+                        tracing::warn!(
+                            error = llg.get_error().unwrap_or_default(),
+                            "llguidance matcher errored while computing a fast-forward splice"
+                        );
                     }
                 }
             }

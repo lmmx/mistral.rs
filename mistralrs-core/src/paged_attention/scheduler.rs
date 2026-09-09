@@ -540,6 +540,7 @@ impl PagedAttentionScheduler {
     fn completion_token_cost(seq: &Sequence) -> usize {
         seq.num_uncomputed_tokens()
             .saturating_add(seq.active_staged_speculative_len())
+            .saturating_add(seq.active_pending_ff_tokens().len())
             .max(1)
     }
 
@@ -1184,8 +1185,11 @@ impl PagedAttentionScheduler {
             let seq_guard = get_mut_arcmutex!(seq);
             let seq_id = *seq_guard.id();
             let staged_speculative = seq_guard.active_staged_speculative_len();
+            let pending_ff = seq_guard.active_pending_ff_tokens().len();
             let num_tokens = if staged_speculative > 0 {
                 seq_guard.len() + staged_speculative
+            } else if pending_ff > 0 {
+                seq_guard.len() + pending_ff
             } else if seq_guard.num_uncomputed_tokens() > 0 {
                 seq_guard.len()
             } else {
@@ -1378,6 +1382,10 @@ impl PagedAttentionScheduler {
         seq_guard.set_state(SequenceState::Waiting);
         seq_guard.set_prefix_cache_len(0);
         seq_guard.clear_staged_speculative_tokens();
+        // A preempted sequence returns through the prefill path, which never consumes
+        // `pending_ff_tokens`, so a surviving splice would otherwise be replayed later against a
+        // KV cache that never computed it.
+        seq_guard.discard_pending_ff_tokens();
         let seq_id = *seq_guard.id();
         self.preempted_sequence_ids.push(seq_id);
         let num_computed_tokens = seq_guard.num_computed_tokens();

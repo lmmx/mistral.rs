@@ -1535,6 +1535,28 @@ pub mod text_models_inputs_processor {
         }
     }
 
+    /// Decides, once per completion step, which sequences' staged fast-forward splices actually
+    /// reach this step's decode window, and discards the rest via
+    /// `Sequence::discard_pending_ff_tokens`. Splice lengths are data-dependent per sequence, so a
+    /// batch of two or more grammar-constrained sequences is `StagedBatchState::Mixed` in the
+    /// common case; without this, a sequence whose splice was staged but not fed would grow by
+    /// `splice_len + 1` tokens against a KV cache that only grew by 1 position. Must run before
+    /// `make_completion_chunk`, which needs the resulting `active_pending_ff_tokens()` to already
+    /// agree with `pending_ff_batch_width` across the batch -- it can't discard mismatched splices
+    /// itself, since it only holds a shared `&[&mut Sequence]`.
+    fn resolve_pending_ff_batch(seqs: &mut [&mut Sequence]) {
+        if let crate::speculative::staging::StagedBatchState::Homogeneous(_) =
+            crate::speculative::staging::staged_batch_state_from_widths(
+                seqs.iter().map(|seq| seq.active_pending_ff_tokens().len()),
+            )
+        {
+            return;
+        }
+        for seq in seqs.iter_mut() {
+            seq.discard_pending_ff_tokens();
+        }
+    }
+
     fn make_completion_chunk<T: WithDType + From<u32> + Clone + std::fmt::Debug>(
         toks: Vec<&[T]>,
         input_seqs: &[&mut Sequence],
@@ -2643,6 +2665,9 @@ pub mod text_models_inputs_processor {
             mapper: Option<&dyn DeviceMapper>,
         ) -> Result<InputProcessorOutput> {
             let flash_sliding_window = if no_kv_cache { None } else { sliding_window };
+            if !is_prompt {
+                resolve_pending_ff_batch(input_seqs);
+            }
             if is_xlora && !is_prompt {
                 let prompt = get_prompt_input(
                     input_seqs

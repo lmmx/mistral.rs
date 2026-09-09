@@ -1257,6 +1257,27 @@ impl Sequence {
         std::mem::take(&mut self.pending_ff_tokens)
     }
 
+    /// Discards a staged fast-forward splice that will not reach the decode window this step
+    /// (mixed-width batch, preemption, ...), rolling the llguidance matcher back by the splice
+    /// length. `Matcher::consume_ff_tokens` already advanced the matcher past the splice at
+    /// stage time, so leaving it staged there would compute every later mask at the wrong
+    /// grammar position. No-op if no splice is staged.
+    pub(crate) fn discard_pending_ff_tokens(&mut self) {
+        let splice = self.take_pending_ff_tokens();
+        if splice.is_empty() {
+            return;
+        }
+        if let SequenceRecognizer::Llguidance(ref mut llg) = self.recognizer {
+            if let Err(e) = llg.rollback(splice.len()) {
+                tracing::warn!(
+                    error = %e,
+                    "failed to roll back llguidance matcher after discarding a fast-forward splice"
+                );
+            }
+        }
+        metrics::counter!("mistralrs_grammar_ff_splice_drops_total").increment(1);
+    }
+
     pub fn get_initial_prompt(&self) -> &str {
         &self.prompt
     }
