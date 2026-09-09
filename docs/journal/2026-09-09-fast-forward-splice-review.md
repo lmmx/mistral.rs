@@ -3,7 +3,8 @@
 Review of branch `grammar-fast-forward` (commits `e7bba90be`, `e9b0eac07`, `d217eb32b` on top of
 v0.9.3 `d5ae0f18f`) against the layering that SGLang, llguidance and vLLM V1 converged on for
 grammar jump-forward decoding. Reviewed by Claude Opus 5; branch authored by Louis Maddox with
-Claude Sonnet. `cargo check -p mistralrs-core` passes on `d217eb32b`.
+Claude Sonnet. Build status on `d217eb32b` is unverified: build scripts cannot execute in
+the review container, so no `cargo` invocation in the review session completed.
 
 Three defects block correctness outside the single-sequence CPU configuration that `ff_bench.py`
 measures. Sections "Current State" through "Divergence" carry the machine-checkable statements.
@@ -266,7 +267,9 @@ carrying different grammars exposes Defect 1, and enabling PagedAttention expose
 - `TokenParser::ff_tokens` performs splice-boundary retokenization inside llguidance without
   engine-side backtracking, chopping trailing bytes a longer token could extend
   (llguidance-1.4.0 tokenparser.rs:677-726, 200).
-- `cargo check -p mistralrs-core` completes with exit code 0 on `d217eb32b`.
+- `cargo` build scripts fail to execute in the review container with `No such file or
+  directory (os error 2)`, so `cargo check -p mistralrs-core` and `cargo test -p
+  mistralrs-core` produce no build status for `d217eb32b` from the review session.
 
 ## Stubbed
 
