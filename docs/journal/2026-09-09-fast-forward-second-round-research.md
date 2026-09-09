@@ -6,6 +6,40 @@ entries on this branch. Two purposes: test whether an independent reader reaches
 conclusions, and find what a reader who starts from a different question finds. Self-contained.
 No build ran; no `cargo` invocation completes in this container.
 
+## Summary
+
+The mechanism works. Nothing below says it is fundamentally broken, and nothing below reopens a
+defect the first-pass review closed. What this entry says is that fast-forward does not yet
+integrate cleanly with four systems that already existed — recurrent-model dispatch, batch
+scheduling, MoE routing and the metrics — and that one of those four can change output rather than
+just speed.
+
+In order of how much they matter:
+
+1. **AnyMoE output can differ with the flag on.** This is the only finding that touches correctness
+   rather than performance, and it is unverified. An AnyMoE model inherits the feature without
+   anyone having decided that, and its router picks one expert per *window* rather than per *token*
+   — so a widened window routes differently. Fast-forward is defended as an optimisation that cannot
+   change output; on AnyMoE it can. (New D.)
+2. **Hybrid recurrent models take the slow path on every fast-forward step.** Nine sites enable
+   multi-token recurrent handling only for speculative decoding, by name, and a fast-forward window
+   is not labelled that way. Each falls through to the general path, which is conservative and
+   probably correct but forfeits exactly the saving the feature exists for. Needs a CUDA build to
+   settle. (New A.)
+3. **The scheduler composes batches without knowing whether their splices can be used**, so it
+   admits combinations that are then discarded wholesale. Not a correctness bug — the discard is
+   what makes it safe — but it means the concurrency limitation is not located solely where the
+   prior entries place it. (New B.)
+4. **The published drop-rate metric cannot balance.** Some splices are neither fed nor dropped, and
+   they sit in the denominator of the ratio the observability docs tell operators to watch. (New E.)
+
+One further section (New C) is not a problem found in the code; it is an option for addressing (3)
+that the prior entries did not consider — shortening splices to a common length instead of
+discarding them.
+
+Everything else in this entry either corroborates a round-one finding independently, or withdraws a
+suspicion this pass raised and then disproved.
+
 ---
 
 ## Long form
