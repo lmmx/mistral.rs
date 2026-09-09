@@ -1380,6 +1380,7 @@ impl Sequence {
         self.tokens.clone_from(&toks);
         self.prompt_len = self.tokens.len();
         self.clear_staged_speculative_tokens();
+        self.discard_pending_ff_tokens();
         self.num_computed_tokens = 0;
         self.bump_block_hash_revision();
 

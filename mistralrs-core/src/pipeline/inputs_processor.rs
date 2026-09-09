@@ -2439,6 +2439,20 @@ pub mod text_models_inputs_processor {
         sliding_window: Option<usize>,
         decode_window: usize,
     ) -> Result<InputMetadata> {
+        // This window builder never reads `pending_ff_tokens`, unlike `make_completion_chunk`,
+        // which widens the window to fit a homogeneous splice. Any splice reaching here -- of
+        // any width -- would be silently dropped from the block-diffusion window, so treat it as
+        // an error rather than the homogeneous-width fallback used there.
+        if input_seqs
+            .iter()
+            .any(|seq| !seq.active_pending_ff_tokens().is_empty())
+        {
+            anyhow::bail!(
+                "sequence carries a pending grammar fast-forward splice, which \
+                 make_completion_prefill_chunk does not support; resolve_pending_ff_batch \
+                 must run first"
+            );
+        }
         let prefix_cache_lens = toks
             .iter()
             .map(|ctxt| ctxt.len().saturating_sub(decode_window))
