@@ -1385,7 +1385,7 @@ impl PagedAttentionScheduler {
         // A preempted sequence returns through the prefill path, which never consumes
         // `pending_ff_tokens`, so a surviving splice would otherwise be replayed later against a
         // KV cache that never computed it.
-        seq_guard.discard_pending_ff_tokens();
+        seq_guard.discard_pending_ff_tokens("preemption");
         let seq_id = *seq_guard.id();
         self.preempted_sequence_ids.push(seq_id);
         let num_computed_tokens = seq_guard.num_computed_tokens();

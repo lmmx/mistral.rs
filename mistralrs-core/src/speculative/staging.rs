@@ -75,7 +75,7 @@ pub(crate) fn resolve_pending_ff_batch(seqs: &mut [&mut Sequence]) {
         return;
     }
     for seq in seqs.iter_mut() {
-        seq.discard_pending_ff_tokens();
+        seq.discard_pending_ff_tokens("batch_shape");
     }
 }
 

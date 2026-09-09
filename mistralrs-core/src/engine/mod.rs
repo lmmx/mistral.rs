@@ -1851,6 +1851,14 @@ impl Engine {
                                 let pending_ff = pending_ff_width
                                     .map(|_| seq.active_pending_ff_tokens().len())
                                     .unwrap_or_default();
+                                if pending_ff > 0 {
+                                    // Counted here, not where the splice was staged: a staged
+                                    // splice that gets discarded by `resolve_pending_ff_batch`
+                                    // (mixed-width batch) never reaches the window and is counted
+                                    // as a drop instead, not fed.
+                                    metrics::counter!("mistralrs_grammar_ff_tokens_fed_total")
+                                        .increment(pending_ff as u64);
+                                }
                                 seq.num_uncomputed_tokens()
                                     .saturating_add(staged)
                                     .saturating_add(pending_ff)

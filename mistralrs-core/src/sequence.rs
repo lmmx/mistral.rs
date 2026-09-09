@@ -1261,8 +1261,9 @@ impl Sequence {
     /// (mixed-width batch, preemption, ...), rolling the llguidance matcher back by the splice
     /// length. `Matcher::consume_ff_tokens` already advanced the matcher past the splice at
     /// stage time, so leaving it staged there would compute every later mask at the wrong
-    /// grammar position. No-op if no splice is staged.
-    pub(crate) fn discard_pending_ff_tokens(&mut self) {
+    /// grammar position. No-op if no splice is staged. `reason` labels
+    /// `mistralrs_grammar_ff_splice_drops_total` for the caller's discard site.
+    pub(crate) fn discard_pending_ff_tokens(&mut self, reason: &'static str) {
         let splice = self.take_pending_ff_tokens();
         if splice.is_empty() {
             return;
@@ -1284,7 +1285,8 @@ impl Sequence {
                 self.set_state(SequenceState::Error);
             }
         }
-        metrics::counter!("mistralrs_grammar_ff_splice_drops_total").increment(1);
+        metrics::counter!("mistralrs_grammar_ff_splice_drops_total", "reason" => reason)
+            .increment(1);
     }
 
     pub fn get_initial_prompt(&self) -> &str {
@@ -1380,7 +1382,7 @@ impl Sequence {
         self.tokens.clone_from(&toks);
         self.prompt_len = self.tokens.len();
         self.clear_staged_speculative_tokens();
-        self.discard_pending_ff_tokens();
+        self.discard_pending_ff_tokens("realloc");
         self.num_computed_tokens = 0;
         self.bump_block_hash_revision();
 

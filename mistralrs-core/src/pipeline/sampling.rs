@@ -1642,6 +1642,7 @@ pub async fn sample_sequence(
                     // Staging it anyway would commit tokens the matcher never actually accepted.
                     if !splice.is_empty() && !llg.is_error() {
                         tracing::debug!(splice_len = splice.len(), "fast-forward splice computed");
+                        metrics::counter!("mistralrs_grammar_ff_splices_staged_total").increment(1);
                         seq.set_pending_ff_tokens(splice);
                     } else if llg.is_error() {
                         tracing::warn!(
