@@ -1522,41 +1522,6 @@ pub mod text_models_inputs_processor {
         Ok(Tensor::cat(&[&host, &staged], 1)?)
     }
 
-    /// Homogeneous-width check for `Sequence::pending_ff_tokens`, mirroring
-    /// `speculative::staging::staged_batch_width`: a batch mixing forced and non-forced
-    /// sequences, or forced sequences of differing splice length, falls back to `None` (no
-    /// widening for this step) rather than a ragged decode window.
-    fn pending_ff_batch_width(seqs: &[&mut Sequence]) -> Option<usize> {
-        match crate::speculative::staging::staged_batch_state_from_widths(
-            seqs.iter().map(|seq| seq.active_pending_ff_tokens().len()),
-        ) {
-            crate::speculative::staging::StagedBatchState::Homogeneous(width) => Some(width),
-            _ => None,
-        }
-    }
-
-    /// Decides, once per completion step, which sequences' staged fast-forward splices actually
-    /// reach this step's decode window, and discards the rest via
-    /// `Sequence::discard_pending_ff_tokens`. Splice lengths are data-dependent per sequence, so a
-    /// batch of two or more grammar-constrained sequences is `StagedBatchState::Mixed` in the
-    /// common case; without this, a sequence whose splice was staged but not fed would grow by
-    /// `splice_len + 1` tokens against a KV cache that only grew by 1 position. Must run before
-    /// `make_completion_chunk`, which needs the resulting `active_pending_ff_tokens()` to already
-    /// agree with `pending_ff_batch_width` across the batch -- it can't discard mismatched splices
-    /// itself, since it only holds a shared `&[&mut Sequence]`.
-    fn resolve_pending_ff_batch(seqs: &mut [&mut Sequence]) {
-        if let crate::speculative::staging::StagedBatchState::Homogeneous(_) =
-            crate::speculative::staging::staged_batch_state_from_widths(
-                seqs.iter().map(|seq| seq.active_pending_ff_tokens().len()),
-            )
-        {
-            return;
-        }
-        for seq in seqs.iter_mut() {
-            seq.discard_pending_ff_tokens();
-        }
-    }
-
     fn make_completion_chunk<T: WithDType + From<u32> + Clone + std::fmt::Debug>(
         toks: Vec<&[T]>,
         input_seqs: &[&mut Sequence],
@@ -1592,7 +1557,18 @@ pub mod text_models_inputs_processor {
                 .any(|seq| seq.active_staged_speculative_tokens().as_device().is_some());
         // Grammar fast-forward tokens: same all-or-none homogeneous-width fallback as staged
         // speculative tokens above, over a different (always host-side) `Sequence` field.
-        let use_pending_ff = pending_ff_batch_width(input_seqs).is_some();
+        let use_pending_ff =
+            crate::speculative::staging::pending_ff_batch_width(input_seqs).is_some();
+        if !use_pending_ff
+            && input_seqs
+                .iter()
+                .any(|seq| !seq.active_pending_ff_tokens().is_empty())
+        {
+            anyhow::bail!(
+                "sequence carries a pending grammar fast-forward splice that was not resolved \
+                 before the decode window was built; resolve_pending_ff_batch must run first"
+            );
+        }
         let sequence_block_tables = paged_attn_metadata.as_ref().map(|paged_attn_metadata| {
             let kv_mgr = get_mut_arcmutex!(paged_attn_metadata.kv_cache_manager);
             input_seqs
@@ -2665,9 +2641,6 @@ pub mod text_models_inputs_processor {
             mapper: Option<&dyn DeviceMapper>,
         ) -> Result<InputProcessorOutput> {
             let flash_sliding_window = if no_kv_cache { None } else { sliding_window };
-            if !is_prompt {
-                resolve_pending_ff_batch(input_seqs);
-            }
             if is_xlora && !is_prompt {
                 let prompt = get_prompt_input(
                     input_seqs
@@ -3230,90 +3203,6 @@ pub mod text_models_inputs_processor {
         fn sliding_metadata_rejects_inconsistent_lengths() {
             assert!(sliding_k_lengths(&[0, 2], &[0], 4).is_err());
             assert!(sliding_k_lengths(&[0, 3], &[0, 2], 4).is_err());
-        }
-
-        fn ff_test_sequence(id: usize) -> Sequence {
-            use crate::sampler::Sampler;
-            use crate::sequence::{SeqStepType, SequenceGroup, SequenceRecognizer};
-            use tokio::sync::{mpsc::channel, Mutex as TokioMutex};
-
-            let (tx, _rx) = channel(1);
-            let sampler = Sampler::new(
-                None,
-                0,
-                None,
-                None,
-                None,
-                None,
-                None,
-                32,
-                1.0,
-                0.0,
-                HashMap::new(),
-                vec![],
-            )
-            .unwrap();
-            let group = Arc::new(TokioMutex::new(SequenceGroup::new(1, false, true, None)));
-            Sequence::new_waiting(
-                vec![1; 4],
-                "prompt".to_string(),
-                id,
-                id as u128,
-                1,
-                tx,
-                sampler,
-                vec![],
-                vec![],
-                None,
-                false,
-                false,
-                group,
-                0,
-                0,
-                SequenceRecognizer::None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(8),
-                None,
-                None,
-                SeqStepType::PromptAndDecode,
-                None,
-                None,
-                None,
-                false,
-                false,
-                vec![],
-                None,
-            )
-        }
-
-        #[test]
-        fn resolve_pending_ff_batch_discards_mismatched_splice_widths() {
-            let mut seqs: Vec<Sequence> = (0..2).map(ff_test_sequence).collect();
-            seqs[0].set_pending_ff_tokens(vec![10, 11, 12]);
-            seqs[1].set_pending_ff_tokens(vec![20, 21]);
-
-            let mut refs: Vec<&mut Sequence> = seqs.iter_mut().collect();
-            resolve_pending_ff_batch(&mut refs);
-
-            assert!(refs[0].active_pending_ff_tokens().is_empty());
-            assert!(refs[1].active_pending_ff_tokens().is_empty());
-        }
-
-        #[test]
-        fn resolve_pending_ff_batch_keeps_equal_width_splices() {
-            let mut seqs: Vec<Sequence> = (0..2).map(ff_test_sequence).collect();
-            seqs[0].set_pending_ff_tokens(vec![10, 11]);
-            seqs[1].set_pending_ff_tokens(vec![20, 21]);
-
-            let mut refs: Vec<&mut Sequence> = seqs.iter_mut().collect();
-            resolve_pending_ff_batch(&mut refs);
-
-            assert_eq!(refs[0].active_pending_ff_tokens(), &[10, 11]);
-            assert_eq!(refs[1].active_pending_ff_tokens(), &[20, 21]);
         }
     }
 }

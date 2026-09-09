@@ -1814,6 +1814,16 @@ impl Engine {
                         let mut guards_mut =
                             guards.iter_mut().map(|seq| &mut **seq).collect::<Vec<_>>();
 
+                        // Resolve staged fast-forward splices before anything below reads their
+                        // width: `scheduled_token_counts` and the decode window both need the
+                        // survivors, not the ones about to be discarded. Only a decode step can
+                        // carry a splice (see `sample_sequence`), so a prompt step has nothing to
+                        // resolve.
+                        if !is_prompt {
+                            crate::speculative::staging::resolve_pending_ff_batch(&mut guards_mut);
+                        }
+                        let pending_ff_width =
+                            crate::speculative::staging::pending_ff_batch_width(&guards_mut);
                         let staged_width =
                             crate::speculative::staging::staged_batch_width(&guards_mut);
                         let scheduler_visible_prompt_step =
@@ -1838,7 +1848,12 @@ impl Engine {
                                 let staged = staged_width
                                     .map(|_| seq.active_staged_speculative_len())
                                     .unwrap_or_default();
-                                seq.num_uncomputed_tokens().saturating_add(staged)
+                                let pending_ff = pending_ff_width
+                                    .map(|_| seq.active_pending_ff_tokens().len())
+                                    .unwrap_or_default();
+                                seq.num_uncomputed_tokens()
+                                    .saturating_add(staged)
+                                    .saturating_add(pending_ff)
                             })
                             .collect::<Vec<_>>();
 
