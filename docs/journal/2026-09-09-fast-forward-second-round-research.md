@@ -40,6 +40,95 @@ discarding them.
 Everything else in this entry either corroborates a round-one finding independently, or withdraws a
 suspicion this pass raised and then disproved.
 
+## Resolving the open questions
+
+The three unresolved items below each name a model class rather than a model. This section names
+models, sizes and the check that settles each, so none of them reads as "needs a CUDA build".
+
+Two corrections to note first, because both change the cost by an order of magnitude:
+
+- **AnyMoE is not tied to Mistral-7B.** The repo's own examples use
+  `mistralai/Mistral-7B-Instruct-v0.1` as base with `HuggingFaceH4/zephyr-7b-beta` as expert, about
+  40 GB for the pair, and the LoRA-expert example points at `typeof/zephyr-7b-beta-lora`, which no
+  longer resolves. Nothing requires either. `create_anymoe_layers` is implemented by fourteen
+  architectures, `models/qwen3.rs`, `models/qwen2.rs` and `models/smollm3.rs` among them, so base
+  and expert can both be Qwen3-0.6B. `AnyMoeConfig::hidden_size` (amoe/mod.rs:144) is read straight
+  into `linear(config.hidden_size, n_experts, vb)` (amoe/mod.rs:207), so it is the base model's own
+  `hidden_size` from its `config.json`, not the 4096 the shipped TOML hardcodes.
+- **`ibm-granite/granite-4.0-micro` exercises no Mamba code.** `models/granite.rs` builds a
+  `MambaLayer` only for layers whose `layer_types` entry is `GraniteLayerType::Mamba`
+  (granite.rs:55, 94). The dense Granite 4 variants carry no such entry. Any Granite candidate has
+  to be checked by reading `layer_types` out of its `config.json` before downloading the weights;
+  the hybrid line (`-h-` in the repo name) is where to look, and the 350M member of it is the
+  smallest, at well under a gigabyte. The exact repo ids are unverified here.
+
+### Question 1: does AnyMoE routing actually diverge? (New D)
+
+The cheapest of the three, and the only one that needs no GPU at all: `AnyMoeLoader` warns and
+disables PagedAttention (pipeline/amoe.rs:66-70), so this path never wanted a paged build.
+
+- Base and expert: Qwen3-0.6B for both, roughly 2.5 GB on disk for the pair.
+- Gate training data: `examples/amoe.json` ships in the repo, ten rows, and is enough to produce a
+  gate that discriminates. Cut `layers` to `[0, 1, 2]` and `epochs` to 25 to keep the fitting pass
+  to minutes.
+- `hidden_size`: take it from the base model's `config.json`.
+- The check: one prompt, `temperature=0.0`, a *partially* forcing grammar such as a small JSON
+  schema — not the fully forcing regex `ff_bench.py` uses, which pins both runs to the same string
+  by construction and can therefore never fail. Run with `MISTRALRS_GRAMMAR_FAST_FORWARD` unset and
+  set, and assert token-for-token equality.
+- What makes it diagnostic rather than just pass/fail: log the `topk(1)` index chosen at
+  amoe/mod.rs:266 per forward. Equal outputs with differing expert indices is a different result
+  from equal outputs with equal indices, and only the second retires the finding.
+
+### Question 2: what do the nine `SpeculativeDecode` sites cost? (New A)
+
+Split this in two. "Which branch is taken" costs nothing and needs no GPU. "Is the branch it takes
+numerically right, and how much does it cost" needs CUDA, because `gdn/layer.rs:532` and the
+Qwen3.5 `transition_gdn` and `deferred_gdn` paths are CUDA-gated.
+
+The first half is a `tracing::debug!` at each of the nine sites recording which arm ran, then one
+CPU run per architecture family with the flag on and a forcing grammar. That alone confirms or
+refutes the claim in New A, which is a claim about control flow.
+
+Model per recurrent family, smallest first:
+
+| Family | Code exercised | Smallest checkpoint | Approx. size | CPU? |
+|---|---|---|---|---|
+| Short convolution | `models/lfm2.rs` | `LiquidAI/LFM2.5-230M` | 0.46 GB | yes |
+| Gated delta net | `gdn/backend.rs`, `gdn/layer.rs`, `vision_models/qwen3_5/text.rs` | `Qwen/Qwen3.5-0.8B` | ~1.5 GB | yes, tight |
+| Mamba SSM | `models/granite.rs` | Granite 4 hybrid, 350M member | <1 GB | yes |
+
+Three notes on that table. Qwen3.5-0.8B replaces the 4B the demo used and reaches the same GDN
+code, so the GDN question does not need the larger download. `Qwen/Qwen3-Next-80B-A3B-Instruct` is
+the only released Qwen3-Next size at roughly 163 GB, and it shares `gdn/` with Qwen3.5, so
+Qwen3.5-0.8B covers `models/qwen3_next.rs`'s recurrent behaviour without it. LFM2 is the family
+round one's W3 argument turns on (`models/lfm2.rs:1283-1284`), so LFM2.5-230M is also the model
+that would catch a regression if anyone revisits the enum-variant decision.
+
+### Question 3: what is the batch_shape drop rate under real load? (New B, and the sizing input for New C and round one's D1)
+
+Model choice is irrelevant here — the question is about scheduling, not about any model's numerics.
+Use whichever of the above is already downloaded.
+
+- The scheduler half needs PagedAttention, so it needs a CUDA or Metal build:
+  `paged_attn_supported()` is a compile-time `const fn` that returns `false` on a CPU build
+  (utils/mod.rs:297-305).
+- Drive N concurrent requests carrying *different* JSON schemas, which is the shape that produces
+  differing splice widths, and read
+  `mistralrs_grammar_ff_splice_drops_total{reason="batch_shape"}` against
+  `mistralrs_grammar_ff_splices_staged_total`.
+- **This measurement depends on New E being fixed first.** Splices staged on a step whose sampled
+  token ends the sequence are counted in the denominator and can never appear in the numerator, so
+  the ratio reads low until that is corrected. Fixing the counter is a prerequisite for sizing
+  D1 and New C, not an independent piece of tidying.
+
+### Harness
+
+`ff_bench.py` on this branch is the starting point: it builds a `Runner` over `Which.GGUF` and times
+repeats around a fixed grammar. Questions 1 and 2 need `Which.Plain` instead, since none of the
+models above is being fetched as GGUF here, and need an equality assertion rather than a timing
+loop. Question 3 needs concurrent request submission, which `ff_bench.py` has no shape for today.
+
 ---
 
 ## Long form
