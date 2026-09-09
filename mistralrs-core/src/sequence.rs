@@ -782,9 +782,7 @@ pub struct Sequence {
     staged_speculative_tokens: SpeculativeTokens,
     staged_speculative_distribution: Option<SpeculativeProposalDistribution>,
 
-    // Grammar fast-forward: tokens the active llguidance matcher has already committed to
-    // (Matcher::consume_ff_tokens), staged for the next decode window. Unlike staged speculative
-    // tokens these are grammar-certain, not a draft proposal, so there's no distribution to verify.
+    // Grammar fast-forward: tokens already committed by the matcher, staged for the next decode window.
     pending_ff_tokens: Vec<u32>,
 
     // Prefix caching
@@ -1257,11 +1255,8 @@ impl Sequence {
         std::mem::take(&mut self.pending_ff_tokens)
     }
 
-    /// Discards a staged fast-forward splice that will not reach the decode window this step
-    /// (mixed-width batch, preemption, ...), rolling the llguidance matcher back by the splice
-    /// length. `Matcher::consume_ff_tokens` already advanced the matcher past the splice at
-    /// stage time, so leaving it staged there would compute every later mask at the wrong
-    /// grammar position. No-op if no splice is staged. `reason` labels
+    /// Discards a staged fast-forward splice that won't reach the decode window this step,
+    /// rolling the llguidance matcher back by the splice length. `reason` labels
     /// `mistralrs_grammar_ff_splice_drops_total` for the caller's discard site.
     pub(crate) fn discard_pending_ff_tokens(&mut self, reason: &'static str) {
         let splice = self.take_pending_ff_tokens();
@@ -1270,9 +1265,6 @@ impl Sequence {
         }
         if let SequenceRecognizer::Llguidance(ref mut llg) = self.recognizer {
             if let Err(e) = llg.rollback(splice.len()) {
-                // A matcher left advanced past tokens the sequence never emitted would compute
-                // every later grammar mask at the wrong position, so fail the sequence rather
-                // than continue on a corrupted matcher.
                 tracing::warn!(
                     error = %e,
                     "failed to roll back llguidance matcher after discarding a fast-forward \

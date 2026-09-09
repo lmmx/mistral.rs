@@ -718,12 +718,9 @@ pub(crate) async fn finalize_block_gen(
 }
 
 /// Replays a grammar-forced token splice (`Sequence::pending_ff_tokens`) through the normal
-/// per-token completion path, one token at a time -- same shape as `finalize_block_gen` above,
-/// for a single sequence's already-known splice instead of a per-seq diffusion block. The only
-/// difference from a sampled token is these skip the forward pass, since the grammar already
-/// determined them (see the `consume_ff_tokens` call in `sample_sequence`). Returns `true` if the
-/// sequence reached a `Done` state partway through the splice, in which case the caller must not
-/// go on to apply the token sampled after it.
+/// per-token completion path, one token at a time, skipping the forward pass since the grammar
+/// already determined them. Returns `true` if the sequence reached `Done` partway through the
+/// splice, in which case the caller must not apply the token sampled after it.
 async fn apply_pending_ff_tokens(
     this: &dyn Pipeline,
     prefix_cacher: &mut PrefixCacheManagerV2,
@@ -731,13 +728,9 @@ async fn apply_pending_ff_tokens(
     pending_ff: Vec<u32>,
     eos_tok: Option<&[u32]>,
 ) -> Result<bool> {
-    // A request with `return_logprobs` set expects every recorded token to carry
-    // `top_logprobs`; `finish_or_add_toks_to_seq`'s Done-state handling unwraps it
-    // unconditionally. A forced token has exactly one candidate (itself, at probability 1).
+    // finish_or_add_toks_to_seq's Done-state handling unwraps top_logprobs unconditionally when
+    // return_logprobs is set; a forced token has exactly one candidate, itself at probability 1.
     let return_logprobs = seq.return_logprobs();
-    // A replayed token carries the same `bytes` and `top_logprobs` shape as a sampled one,
-    // because `finish_or_add_toks_to_seq` unwraps both unconditionally in its Done-state
-    // handling.
     let tok_env = this
         .get_metadata()
         .tok_env()
@@ -848,11 +841,9 @@ async fn sample_and_add_toks_inner(
     let eos_toks = metadata.eos_tok.clone();
     let supports_fast_forward = metadata.supports_grammar_fast_forward;
 
-    // Replay each sequence's staged fast-forward splice (see `sample_sequence`'s
-    // `consume_ff_tokens` call) before sampling below, not after: the penalty context and
-    // `generated_len()` that sampling reads must include the tokens this window already decoded,
-    // and a sequence the replay finishes must not reach `sample_sequence` at all -- it would
-    // otherwise advance the llguidance matcher and stage a new splice for a non-running sequence.
+    // Replay each sequence's staged fast-forward splice before sampling below: sampling reads
+    // penalty context and generated_len(), which must include the replayed tokens, and a sequence
+    // the replay finishes must not reach sample_sequence (it would stage a new splice).
     let mut finished_mask = vec![false; seqs_len];
     let mut any_finished = false;
     for (idx, seq) in seqs.iter_mut().enumerate() {
@@ -908,10 +899,8 @@ async fn sample_and_add_toks_inner(
             }
         }
     } else {
-        // A splice finished at least one sequence this step: sample only the sequences still
-        // running, using their logits rows. Rare enough (only when a grammar-forced splice lands
-        // exactly on a stop condition) that skipping the CUDA batched path here isn't worth the
-        // extra row-selection bookkeeping.
+        // A splice finished at least one sequence this step; sample only the still-running ones.
+        // Rare enough not to be worth the CUDA batched path's row-selection bookkeeping.
         let all_rows = logits.into_cpu_rows()?;
         let running_rows: Vec<_> = std::iter::zip(all_rows, finished_mask.iter())
             .filter(|(_, &finished)| !finished)
@@ -1630,16 +1619,12 @@ pub async fn sample_sequence(
             if !llg.is_stopped() && !ends_turn {
                 llg.consume_token(second_logprobs_response.token)
                     .map_err(candle_core::Error::msg)?;
-                // The matcher may now have a single legal continuation for the next several
-                // tokens (e.g. the rest of a forced tool-call scaffold). Stage it so the next
-                // decode window can feed these back in without a forward pass each -- only for
-                // pipelines whose input builder actually consumes `pending_ff_tokens`; see
-                // `GeneralMetadata::supports_grammar_fast_forward`.
+                // Stage any forced continuation (e.g. the rest of a tool call) for the next
+                // decode window to replay without a forward pass.
                 if supports_fast_forward && !llg.is_stopped() {
                     let splice = llg.consume_ff_tokens();
-                    // `consume_ff_tokens` discards the `Result` of its internal `consume_tokens`
-                    // call, so a splice it returns may have left the matcher in an error state.
-                    // Staging it anyway would commit tokens the matcher never actually accepted.
+                    // consume_ff_tokens discards its internal consume_tokens error, so check
+                    // is_error before committing tokens the matcher may not have accepted.
                     if !splice.is_empty() && !llg.is_error() {
                         tracing::debug!(splice_len = splice.len(), "fast-forward splice computed");
                         metrics::counter!("mistralrs_grammar_ff_splices_staged_total").increment(1);

@@ -11,11 +11,7 @@ pub(crate) fn staged_batch_state(seqs: &[&mut Sequence]) -> StagedBatchState {
     staged_batch_state_from_widths(seqs.iter().map(|seq| seq.active_staged_speculative_len()))
 }
 
-// Scans per-sequence widths for one of three outcomes: no sequence carries any (`None`), every
-// carrying sequence agrees on a width (`Homogeneous`), or widths disagree, or some sequences carry
-// none while others do (`Mixed`). Used both for staged speculative proposals and for pending
-// grammar fast-forward splices below -- the same "all-or-none across the batch" rule over two
-// different `Sequence` fields.
+// Also used below for pending_ff_batch_width/resolve_pending_ff_batch, over a different field.
 pub(crate) fn staged_batch_state_from_widths(
     widths: impl IntoIterator<Item = usize>,
 ) -> StagedBatchState {
@@ -48,9 +44,6 @@ pub(crate) fn staged_batch_width(seqs: &[&mut Sequence]) -> Option<usize> {
     }
 }
 
-/// Homogeneous-width check for `Sequence::pending_ff_tokens`, mirroring `staged_batch_width`
-/// above: a batch mixing forced and non-forced sequences, or forced sequences of differing splice
-/// length, falls back to `None` (no widening for this step) rather than a ragged decode window.
 pub(crate) fn pending_ff_batch_width(seqs: &[&mut Sequence]) -> Option<usize> {
     match staged_batch_state_from_widths(
         seqs.iter().map(|seq| seq.active_pending_ff_tokens().len()),
@@ -60,12 +53,8 @@ pub(crate) fn pending_ff_batch_width(seqs: &[&mut Sequence]) -> Option<usize> {
     }
 }
 
-/// Decides, once per completion step, which sequences' staged fast-forward splices actually
-/// reach this step's decode window: a homogeneous-width batch keeps all of them, anything else
-/// discards every splice in the batch via `Sequence::discard_pending_ff_tokens`, rolling each
-/// back to a consistent matcher state. Must run before the decode window is built and before
-/// `scheduled_token_counts` is computed, so that neither reads a splice width about to be
-/// discarded.
+/// Discards every splice in the batch unless all sequences carrying one agree on its width.
+/// Must run before the decode window and scheduled_token_counts are built.
 pub(crate) fn resolve_pending_ff_batch(seqs: &mut [&mut Sequence]) {
     if let StagedBatchState::Homogeneous(_) = staged_batch_state_from_widths(
         seqs.iter().map(|seq| seq.active_pending_ff_tokens().len()),

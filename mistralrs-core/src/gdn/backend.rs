@@ -829,10 +829,8 @@ pub fn causal_conv1d(
     batch_kind: RecurrentBatchKind,
 ) -> Result<Tensor> {
     let (_, seq_len, _) = x.dims3()?;
-    // A `Decode` step normally queries one new token, but a grammar fast-forward window
-    // (Sequence::pending_ff_tokens) can present several already-known tokens at once.
-    // `causal_conv1d_full` already handles arbitrary widths correctly (proven by prefill and by
-    // `SpeculativeDecode`'s existing multi-token windows) and doesn't care about the kind label.
+    // A fast-forward decode window can carry more than one token; causal_conv1d_full handles
+    // arbitrary widths, so only fall to the single-token path when seq_len is actually 1.
     if matches!(batch_kind, RecurrentBatchKind::Decode) && seq_len == 1 {
         causal_conv1d_update(x, conv1d_weight, dims, cache)
     } else {

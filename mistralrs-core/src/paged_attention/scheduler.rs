@@ -1382,9 +1382,7 @@ impl PagedAttentionScheduler {
         seq_guard.set_state(SequenceState::Waiting);
         seq_guard.set_prefix_cache_len(0);
         seq_guard.clear_staged_speculative_tokens();
-        // A preempted sequence returns through the prefill path, which never consumes
-        // `pending_ff_tokens`, so a surviving splice would otherwise be replayed later against a
-        // KV cache that never computed it.
+        // The prefill path a preempted sequence returns through doesn't consume pending_ff_tokens.
         seq_guard.discard_pending_ff_tokens("preemption");
         let seq_id = *seq_guard.id();
         self.preempted_sequence_ids.push(seq_id);
@@ -4118,11 +4116,7 @@ mod tests {
 
     #[test]
     fn completion_batches_reserve_slots_for_pending_fast_forward_splices() {
-        // block_size is 8 (test_scheduler); a 4-token sequence with no splice needs 1 block
-        // (len + 1 for the next sampled token = 5). A 5-token splice pushes the window to 9
-        // tokens, crossing into a second block -- this only happens if `schedule` reserves for
-        // `active_pending_ff_tokens().len()` rather than falling through to the `len() + 1`
-        // default once `num_uncomputed_tokens() == 0`.
+        // block_size is 8; a 5-token splice should push reservation into a second block.
         let mut scheduler = test_scheduler();
         let seq = test_sequence(0, 4);
         {

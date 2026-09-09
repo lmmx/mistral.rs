@@ -286,10 +286,6 @@ pub(crate) fn build_normal_pipeline(
                 output: vec![SupportedModality::Text],
             },
             loaded_for_uqff_write,
-            // Off by default; opt in via MISTRALRS_GRAMMAR_FAST_FORWARD=1 once you've measured
-            // it's a win for your own grammar shape and hardware; payoff is grammar-shape-dependent.
-            // Requires a KV cache and is unavailable under X-LoRA: both `no_kv_cache` and X-LoRA
-            // build their decode window from `seq.get_toks()`, which does not carry a staged splice.
             supports_grammar_fast_forward: crate::perf_flags::grammar_fast_forward_enabled()
                 && !no_kv_cache
                 && !is_xlora,

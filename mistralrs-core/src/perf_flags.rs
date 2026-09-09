@@ -30,8 +30,6 @@ pub(crate) fn flashinfer_decode_enabled() -> bool {
     *FLASHINFER_DECODE_ENABLED.get_or_init(|| env_flag(FLASHINFER_DECODE_ENV, true))
 }
 
-// Payoff scales with how much of the grammar is forced (long literal spans, closing
-// scaffolding) versus freeform, so this defaults off rather than on.
 pub(crate) fn grammar_fast_forward_enabled() -> bool {
     *GRAMMAR_FAST_FORWARD_ENABLED.get_or_init(|| env_flag(GRAMMAR_FAST_FORWARD_ENV, false))
 }

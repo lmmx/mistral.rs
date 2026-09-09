@@ -1559,10 +1559,8 @@ pub mod text_models_inputs_processor {
         // speculative tokens above, over a different (always host-side) `Sequence` field.
         let use_pending_ff =
             crate::speculative::staging::pending_ff_batch_width(input_seqs).is_some();
-        // An unresolved splice here would append its tokens to the decode window while the KV
-        // cache advances by only one position -- the window grows by `splice_len + 1` tokens
-        // against a cache that computes just one -- so fail loudly instead of building a
-        // mismatched window.
+        // An unresolved splice here would grow the decode window without a matching KV cache
+        // advance, so fail loudly instead of building a mismatched window.
         if !use_pending_ff
             && input_seqs
                 .iter()
@@ -1621,11 +1619,9 @@ pub mod text_models_inputs_processor {
             full_query_lens.push(query_len);
             let effective_context_len = start_pos + query_len;
             seqlen_offsets.push(start_pos);
-            // Forced tokens are already known -- only the position after them needs a sampled
-            // logit, so narrow the (otherwise full-window) hidden-state selection to it instead
-            // of paying lm_head's vocab projection for every forced position. Staged speculative
-            // proposals need every position's logits for verification, so never narrow when a
-            // speculative proposal is active on this sequence.
+            // Forced tokens are already known, so only the position after them needs a sampled
+            // logit; skip lm_head's vocab projection for the rest. Speculative proposals still
+            // need every position's logits for verification, so don't narrow those.
             let narrow_for_ff = !pending_ff.is_empty() && seq.active_staged_speculative_len() == 0;
             context_lens.push(if narrow_for_ff {
                 (query_len - 1, 1)
@@ -2441,10 +2437,8 @@ pub mod text_models_inputs_processor {
         sliding_window: Option<usize>,
         decode_window: usize,
     ) -> Result<InputMetadata> {
-        // This window builder never reads `pending_ff_tokens`, unlike `make_completion_chunk`,
-        // which widens the window to fit a homogeneous splice. Any splice reaching here -- of
-        // any width -- would be silently dropped from the block-diffusion window, so treat it as
-        // an error rather than the homogeneous-width fallback used there.
+        // Unlike make_completion_chunk, this window builder doesn't read pending_ff_tokens, so a
+        // splice reaching here would silently be dropped; treat it as an error instead.
         if input_seqs
             .iter()
             .any(|seq| !seq.active_pending_ff_tokens().is_empty())
