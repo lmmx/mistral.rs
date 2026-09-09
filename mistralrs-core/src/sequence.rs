@@ -1270,13 +1270,9 @@ impl Sequence {
         }
         if let SequenceRecognizer::Llguidance(ref mut llg) = self.recognizer {
             if let Err(e) = llg.rollback(splice.len()) {
-                // Not reachable in practice: `consume_ff_tokens` pushed `splice` onto the
-                // matcher's token list before it was staged, `sample_sequence` never stages a
-                // splice from an already-errored matcher, and nothing between staging and this
-                // discard consumes another token on it. A sequence that got here anyway would
-                // keep running with a matcher advanced past tokens it never emitted, and every
-                // later mask would answer for the wrong grammar position -- wrong output behind
-                // a log line. Fail the sequence instead of continuing on a corrupted matcher.
+                // A matcher left advanced past tokens the sequence never emitted would compute
+                // every later grammar mask at the wrong position, so fail the sequence rather
+                // than continue on a corrupted matcher.
                 tracing::warn!(
                     error = %e,
                     "failed to roll back llguidance matcher after discarding a fast-forward \

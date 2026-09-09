@@ -61,13 +61,11 @@ pub(crate) fn pending_ff_batch_width(seqs: &[&mut Sequence]) -> Option<usize> {
 }
 
 /// Decides, once per completion step, which sequences' staged fast-forward splices actually
-/// reach this step's decode window, and discards the rest via
-/// `Sequence::discard_pending_ff_tokens`. Splice lengths are data-dependent per sequence, so a
-/// batch of two or more grammar-constrained sequences is `StagedBatchState::Mixed` in the
-/// common case; without this, a sequence whose splice was staged but not fed would grow by
-/// `splice_len + 1` tokens against a KV cache that only grew by 1 position. Must run before the
-/// decode window is built, and before `scheduled_token_counts` is computed, so that neither reads
-/// a splice width about to be discarded.
+/// reach this step's decode window: a homogeneous-width batch keeps all of them, anything else
+/// discards every splice in the batch via `Sequence::discard_pending_ff_tokens`, rolling each
+/// back to a consistent matcher state. Must run before the decode window is built and before
+/// `scheduled_token_counts` is computed, so that neither reads a splice width about to be
+/// discarded.
 pub(crate) fn resolve_pending_ff_batch(seqs: &mut [&mut Sequence]) {
     if let StagedBatchState::Homogeneous(_) = staged_batch_state_from_widths(
         seqs.iter().map(|seq| seq.active_pending_ff_tokens().len()),

@@ -735,9 +735,9 @@ async fn apply_pending_ff_tokens(
     // `top_logprobs`; `finish_or_add_toks_to_seq`'s Done-state handling unwraps it
     // unconditionally. A forced token has exactly one candidate (itself, at probability 1).
     let return_logprobs = seq.return_logprobs();
-    // Decode each token's text up front, the same way `finish_or_add_toks_to_seq` derives
-    // `completion_bytes` one line after it receives this `Logprobs`, so a replayed token's
-    // `bytes` matches a sampled token's shape instead of going out as `None`.
+    // A replayed token carries the same `bytes` and `top_logprobs` shape as a sampled one,
+    // because `finish_or_add_toks_to_seq` unwraps both unconditionally in its Done-state
+    // handling.
     let tok_env = this
         .get_metadata()
         .tok_env()

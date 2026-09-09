@@ -1559,6 +1559,10 @@ pub mod text_models_inputs_processor {
         // speculative tokens above, over a different (always host-side) `Sequence` field.
         let use_pending_ff =
             crate::speculative::staging::pending_ff_batch_width(input_seqs).is_some();
+        // An unresolved splice here would append its tokens to the decode window while the KV
+        // cache advances by only one position -- the window grows by `splice_len + 1` tokens
+        // against a cache that computes just one -- so fail loudly instead of building a
+        // mismatched window.
         if !use_pending_ff
             && input_seqs
                 .iter()
@@ -1621,9 +1625,7 @@ pub mod text_models_inputs_processor {
             // logit, so narrow the (otherwise full-window) hidden-state selection to it instead
             // of paying lm_head's vocab projection for every forced position. Staged speculative
             // proposals need every position's logits for verification, so never narrow when a
-            // speculative proposal is active on this sequence (the bail above already rules out
-            // both being active at once; this repeats the check on the raw per-sequence state
-            // rather than relying on that being the only path here).
+            // speculative proposal is active on this sequence.
             let narrow_for_ff = !pending_ff.is_empty() && seq.active_staged_speculative_len() == 0;
             context_lens.push(if narrow_for_ff {
                 (query_len - 1, 1)
