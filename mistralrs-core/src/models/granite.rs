@@ -939,10 +939,12 @@ impl MambaLayer {
         let dtype = x.dtype();
         let (gate, hidden_states_b_c, dt) = self.projected_parts(x)?;
 
-        let y = if matches!(batch_kind, RecurrentBatchKind::Decode) {
-            if seq_len != 1 {
-                candle_core::bail!("Mamba decode expects a single-token query.");
-            }
+        // A `Decode` step normally queries one new token, but a grammar fast-forward window
+        // (Sequence::pending_ff_tokens) can present several already-known tokens at once.
+        // `forward_full` continues from `cache.conv_state`/`cache.ssm_state` rather than
+        // assuming a fresh recurrent state, so it handles arbitrary widths correctly and
+        // doesn't care about the kind label.
+        let y = if matches!(batch_kind, RecurrentBatchKind::Decode) && seq_len == 1 {
             self.forward_cached(
                 &hidden_states_b_c.squeeze(1)?,
                 &dt.squeeze(1)?,
