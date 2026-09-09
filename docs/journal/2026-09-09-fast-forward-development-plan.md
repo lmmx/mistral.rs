@@ -534,3 +534,84 @@ in parallel. Everything else funnels through Task 2.
 - Whether the branch merges as one PR or splits at Task 7. The task graph supports either.
 - Whether D1 is worth its size — a product call with Task 6's drop rate as its input.
 - The order of Tasks 4, 5 and 6 among themselves; only their dependencies are fixed.
+
+---
+
+## Resolved
+
+All eight implementable tasks landed on `grammar-fast-forward` in ten commits, `3f651cc86` through
+`8e4e21606`, one commit per task plus one out-of-plan comment trim. The branch now touches four
+files outside `mistralrs-core/src/`, which was finding N1's substance. Net across the ten commits:
+16 files, 241 insertions, 166 deletions.
+
+**No commit was compiled.** The container that made them carries no Rust toolchain — no `cargo`, no
+`rustc` — so every change was verified by reading, and no claim below rests on a build.
+
+### Landed
+
+| Task | Commit | Files | Effect |
+|---|---|---|---|
+| 1' | `3f651cc86` | `models/granite.rs` | `matches!(batch_kind, Decode)` gains `&& seq_len == 1` and the `bail!("Mamba decode expects a single-token query.")` is deleted, so a splice window falls to `forward_full` |
+| 2 | `a3851faba` | `engine/mod.rs`, `pipeline/inputs_processor.rs`, `speculative/staging.rs` | `pending_ff_batch_width` and `resolve_pending_ff_batch` move to `speculative/staging.rs`; the engine resolves the batch at `engine/mod.rs:1817` before any width is read and adds the `pending_ff` term to `scheduled_token_counts`; `make_completion_chunk` errors on an unresolved splice |
+| 3 | `e6e9f8f40` | `pipeline/normal.rs` | `supports_grammar_fast_forward` gains `&& !no_kv_cache && !is_xlora`; the field's comment drops from 11 lines to 3 |
+| 4 | `2c061c838` | `sequence.rs`, `pipeline/inputs_processor.rs` | `set_toks_and_reallocate` calls `discard_pending_ff_tokens`; `make_completion_prefill_chunk` errors on any splice, with no homogeneous-width escape |
+| 5 | `2dd39c871` | `pipeline/gguf.rs`, `pipeline/ggml.rs`, `pipeline/mod.rs` | both legacy text pipelines read the env flag; the `GeneralMetadata` field comment states the `TextInputsProcessor` contract instead of a correctness claim |
+| 6 | `83deb86ad` | `sequence.rs`, `pipeline/sampling.rs`, `engine/mod.rs`, `speculative/staging.rs`, `paged_attention/scheduler.rs` | `mistralrs_grammar_ff_splices_staged_total` and `mistralrs_grammar_ff_tokens_fed_total` registered; `discard_pending_ff_tokens` takes `reason: &'static str`, passed as `batch_shape`, `preemption`, `realloc` |
+| 7 | `b3a8bb732` | 4 files under `docs/src/content/docs/` | env-var row, three-counter table plus drop-rate PromQL, a "Grammar fast-forward" subsection under "Grammar constraints", one cross-reference in throughput tuning |
+| 8 | `174cd4dde` | `sequence.rs`, `pipeline/inputs_processor.rs`, `pipeline/sampling.rs`, `speculative/staging.rs` | four comment rewrites; the `splice_len + 1` counterfactual moves from a doc comment to the invariant check it describes |
+
+`mistralrs_grammar_ff_tokens_fed_total` increments only where `pending_ff_width` is `Some`, and
+`resolve_pending_ff_batch` has already counted every splice in a batch where it is `None` as a drop
+— the two are mutually exclusive per step, so `drops / staged` is a rate rather than two unrelated
+series divided.
+
+### Deviations from the plan as written
+
+- Task 8's `speculative/staging.rs` rewrite landed early, in `a3851faba` — moving the helpers into
+  that module made the "pub(crate), not private: also reused by inputs_processor.rs" sentence false
+  as well as stale.
+- Task 8's `pipeline/normal.rs` trim landed in `e6e9f8f40` and the `GeneralMetadata` field comment
+  in `2dd39c871`, each beside the code change that made the old text wrong. `174cd4dde` covers the
+  four remaining sites.
+- Task 2's suggested engine-level test, asserting `scheduled_token_counts` for a batch mixing a
+  splice-carrying and a bare sequence equals the flag-off counts, is not written. `engine/mod.rs`
+  carries no harness that constructs a scheduled batch. The width logic is covered by
+  `staged_batch_state_from_widths([15, 0]) == Mixed` and by the two `resolve_pending_ff_batch` tests
+  that moved to `speculative/staging.rs`.
+- Task 5 writes `!self.no_kv_cache` at `pipeline/gguf.rs:1415` and `pipeline/ggml.rs:400`, not the
+  `!no_kv_cache` the plan quoted from Task 3: `no_kv_cache` is a struct field at those two sites and
+  a local binding only in `build_normal_pipeline`. `is_xlora` is a local at all three
+  (`gguf.rs:1319`, `ggml.rs:310`, `normal.rs:170`).
+- `8e4e21606` is not a plan task. The comment above `grammar_fast_forward_enabled`
+  (`perf_flags.rs:33-34`) read "near-zero on mostly-freeform completions, several times faster when
+  a grammar forces long literal spans"; the magnitude generalises the single CPU configuration in
+  `RESULTS.md`, and the comment now states the dependency shape without it.
+- `docs/src/content/docs/guides/serve/structured-output.mdx` says "Span length tracks each request's
+  own position" — "splice" is the internal term and reaches user-facing prose only inside the metric
+  names.
+- `pipeline/sampling.rs:912-914` ("Rare enough ... isn't worth the extra row-selection bookkeeping")
+  stays. It states why the CUDA batched-sampling path is skipped on a step where a splice finished a
+  sequence, which is rationale for a design choice rather than review narration.
+
+### Divergences closed
+
+- `pipeline/mod.rs:1315-1318` no longer calls a false `supports_grammar_fast_forward` outside
+  `NormalPipeline` a correctness requirement, and `GGUFPipeline` and `GGMLPipeline` no longer hold
+  it false (`2dd39c871`).
+- `pipeline/normal.rs` no longer directs operators to a drop counter with no denominator: the
+  sentence is deleted (`e6e9f8f40`) and the denominator exists (`83deb86ad`).
+- The research entry's claims that `mistralrs_decode_tokens_processed_total` omits fast-forward
+  tokens and that the computed-token lag accumulates for the life of the sequence stand withdrawn by
+  W1. `observability.mdx:72` is unedited, and `b3a8bb732` adds no fast-forward clause to it.
+
+### Not landed
+
+- **B1** (F3, Qwen3.5 deferred GDN flush per splice step) and **R1** (CUDA decode-graph eviction
+  under variable splice widths) need a CUDA or Metal build. Neither has one.
+- **D1** (ragged-width windows), **D2** (multimodal input processors) and **D3** (the `pub` API
+  break, which belongs in a PR description) are unchanged and unstarted.
+- **No `cargo build`, `cargo test -p mistralrs-core` or `cargo clippy` has run against any of the ten
+  commits.** The two changes most likely to break mechanically are the `ff_test_sequence` helper,
+  which moved into `speculative/staging.rs`'s test module with its imports re-derived rather than
+  compile-checked, and the `Sequence::discard_pending_ff_tokens` signature change across its three
+  call sites.
