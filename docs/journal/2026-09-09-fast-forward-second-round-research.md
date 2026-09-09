@@ -1,182 +1,328 @@
-# 2026-09-09: Grammar Fast-Forward — Second-Round Comprehensiveness Research
+# 2026-09-09: Grammar fast-forward — second-round research
 
-Research entry. Records what the `grammar-fast-forward` branch touches, what comparable merged
-features touched, and which code paths the branch's decode-window widening reaches that the
-Qwen3.5-4B GGUF CPU demo (`RESULTS.md`) does not exercise. No development plan, no edits.
+Scope: a second, independent read of `grammar-fast-forward` at `8850efa93` (on top of v0.9.3
+`d5ae0f18f`), run without contact with the first-pass review or the round-one research and plan
+entries on this branch. Two purposes: test whether an independent reader reaches the same
+conclusions, and find what a reader who starts from a different question finds. Self-contained.
+No build ran; no `cargo` invocation completes in this container.
 
-## Method
+---
 
-- This round was run without reading `2026-09-09-fast-forward-comprehensiveness-research.md`,
-  `2026-09-09-fast-forward-development-plan.md`, `2026-09-09-fast-forward-remaining-work.md` or
-  `2026-09-09-fast-forward-splice-review.md`, so its findings are independent of round one and
-  agreement between the two rounds carries evidential weight.
-- Branch under review is `grammar-fast-forward` at `8850efa93`, diffed against its merge base
-  with `master`, `d5ae0f18f` (v0.9.3): 23 files, +465/-44.
-- Demo coverage is `unsloth/Qwen3.5-4B-GGUF` Q4_K_M on a 20-core CPU container with no GPU
-  (`RESULTS.md`) — no CUDA, no paged attention, no FlashInfer, no CUDA graphs, no speculative
-  proposer, single request at a time.
+## Long form
 
-## Merged-feature norms (prior art)
+### Why an entry that partly repeats an existing one is worth having
 
-- `feat(gemma4): support MTP speculative decoding! (#2159)` (`bea02b2c4`) is the closest merged
-  analogue — it is the change that introduced the staged-token decode-window widening the
-  fast-forward branch reuses (`mistralrs-core/src/speculative/staging.rs` was added by it).
-- `bea02b2c4` spans 146 files and reaches every user-facing surface: `mistralrs-cli/src/args/mod.rs`
-  plus `commands/{bench,config,run,serve}.rs`, `mistralrs-pyo3/{mistralrs.pyi,src/lib.rs}`,
-  `mistralrs-server-core/src/mistralrs_for_server_builder.rs`, the Rust builder surface
-  (`mistralrs/src/{builder_macros.rs,model_builder_trait.rs,text_model.rs,multimodal_model.rs,auto_model.rs}`),
-  `docs/src/content/docs/guides/perf/` and `docs/src/content/docs/reference/`, and `examples/`.
-- `bea02b2c4` added a per-model trait method to all 24 files under `mistralrs-core/src/models/` and
-  all 7 under `mistralrs-core/src/xlora_models/` in the same commit — the norm for a decode-shape
-  change is to visit every model file rather than the ones a demo model exercises.
-- `MISTRALRS_CUDA_GRAPHS` and `MISTRALRS_FLASHINFER_DECODE`, the only other entries in
-  `mistralrs-core/src/perf_flags.rs`, both default to `true` and are documented as existing "only
-  for debugging and benchmarking comparisons"
-  (`docs/src/content/docs/guides/perf/throughput-tuning.mdx:163`) — both name a path that is on by
-  default and switchable off, neither is the mechanism by which a user opts a feature in.
-- `mistralrs-core` has no `tests/` directory; `mistralrs-flash-attn`, `mistralrs-code-exec`,
-  `mistralrs-quant`, `mistralrs-paged-attn`, `mistralrs-vision` and `mistralrs-sandbox` do. Core
-  coverage is inline `#[test]` modules: 101 in `paged_attention/scheduler.rs`, 42 in `sequence.rs`,
-  17 in `pipeline/inputs_processor.rs`, 11 in `pipeline/sampling.rs`.
+`2026-09-09-fast-forward-splice-review.md`, `-remaining-work.md`, `-comprehensiveness-research.md`
+and `-development-plan.md` were on this branch before this pass began and were not read until after
+its findings were written down. Everything in the "Corroborated" list below was therefore
+re-derived from the diff and the surrounding code rather than restated, which is the only reason
+it is worth writing at all: a finding two readers reach separately from the same source, without
+one seeing the other, is a finding about the code rather than about a reader.
+
+The reverse also holds, and matters more. Round one asked "what does this branch break?" and
+audited the sites that could break. This pass asked "what does the widened decode window silently
+*change*, and who decides the batch it lands in?", and that question reaches a different set of
+files. Four findings below came out of it, and none of them appear in the four prior entries.
+
+### The mechanism, in plain terms
+
+When a grammar leaves exactly one legal continuation for several tokens in a row — the tail of a
+forced literal, the closing brace and comma of a tool-call scaffold — llguidance can hand back the
+whole run at once. The branch takes that run (a "splice"), parks it on the sequence
+(`Sequence::pending_ff_tokens`, sequence.rs:786), and on the next decode step appends it to the
+input window so those positions are computed in one forward pass instead of one each. After the
+forward pass the splice is replayed into the sequence token by token through the ordinary
+completion path, and the token sampled at the position after the splice is applied on top.
+
+The whole thing is off unless `MISTRALRS_GRAMMAR_FAST_FORWARD` is set (perf_flags.rs:33-35), and it
+is refused for pipelines that never learned to consume the field — every `GeneralMetadata`
+construction site outside normal/GGUF/GGML passes `false`.
+
+The demo it was measured on (`RESULTS.md`) is Qwen3.5-4B GGUF on a 20-core CPU container: one
+request at a time, no GPU, no PagedAttention, no flash attention, no CUDA graphs, no speculative
+proposer, greedy sampling, and a regex that forces 100% of the completion. That is a narrow slice
+of the code the branch changed, and round one already anatomised how narrow. This entry does not
+re-do that count; it uses it only to say which of the findings below the 6.1-6.2x measurement
+could not have caught. The answer is all of them.
+
+### Corroborated without contact
+
+Re-derived here independently, and already recorded in the round-one entries. No new detail is
+added and nothing below turns on them:
+
+- `recurrent_batch_kind_for_input` (pipeline/mod.rs:733-744) carries no fast-forward term, so a
+  splice window is labelled `RecurrentBatchKind::Decode` at a width greater than one — a
+  combination that could not occur before this branch (round one F1).
+- `models/granite.rs:944` and `gdn/backend.rs:834` are the two sites that met that combination with
+  a `bail!`, and the branch relaxes both to `&& seq_len == 1`; `models/lfm2.rs:768` already had that
+  shape (round one F2, Task 1').
+- `vision_models/qwen3_5/text.rs:2340-2346` gates `deferred_gdn` on `query_len == 1`, so every
+  splice step on a CUDA Qwen3.5 build falls to `flush_deferred_recurrent_state` (round one F3, open,
+  needs a CUDA build).
+- The branch touches no file outside `mistralrs-core/src/`, where the closest merged precedent
+  (`bea02b2c4`, MTP speculative decoding, 146 files) carried CLI args, pyo3 bindings, the server
+  builder, the Rust builder surface, docs, examples and a uniform two-line edit to every file under
+  `models/` (round one N1). Independently reached here from the same commit.
+- `mistralrs-core` has no `tests/` directory and the norm is inline `#[test]` modules; the branch
+  adds three tests, and none to `sampling.rs`, `inputs_processor.rs` or `sequence.rs`, which hold
+  11, 17 and 42 existing ones (round one Task 6/Task 3 discussion).
+
+### New A: nobody has audited the sites that test for `SpeculativeDecode`
+
+Round one's W3 audited the twelve `== RecurrentBatchKind::Decode` comparisons and asked whether a
+wider window breaks any of them. It concluded — correctly, and the LFM2 argument at
+`models/lfm2.rs:1283-1284` is the decisive part of it — that adding a fourth enum variant would
+introduce a silent corruption the branch does not have. Nothing here disputes W3.
+
+The complementary set was not audited. Nine sites test for `RecurrentBatchKind::SpeculativeDecode`
+specifically, and each of them exists to *enable* a path that only makes sense when the decode
+window is wider than one token:
+
+- `gdn/layer.rs:532` — the CUDA speculative-checkpoint path in `forward_speculative_checkpoints`.
+- `vision_models/qwen3_5/text.rs:850` — `should_stash_gdn_replay`.
+- `vision_models/qwen3_5/text.rs:2321-2324` — `speculative_gdn`, which gates `transition_gdn`.
+- `pipeline/normal.rs:2210` — `transitions_supported` in `snapshot_hybrid_recurrent_checkpoints`.
+- `pipeline/multimodal.rs:1874`, `:2233`; `vision_models/mod.rs:184`, `:243`;
+  `pipeline/cuda_graph.rs:2379`.
+
+A fast-forward window reaches every one of them labelled `Decode`, so every one takes its other
+branch. In each case the other branch is the conservative one — flush the deferred state, snapshot
+the checkpoints, apply the pending transitions eagerly — so the failure mode is not corruption, it
+is that a hybrid-recurrent model on CUDA pays the general path on every splice step while the
+feature is supposed to be saving forward passes. Round one's F3 is one instance of this shape; the
+other eight have not been looked at, and F3's CUDA-build blocker blocks them too.
+
+This *strengthens* W3 rather than reopening it. A `FastForward` variant would not make any of these
+nine fire either, because they test for `SpeculativeDecode` by name. Making them fire means editing
+them one at a time with the recurrent contract of each in hand, which is a different and larger
+piece of work than an enum change, and it is the piece that decides whether this feature is a win
+or a wash on hybrid models.
+
+### New B: the batch is composed before anyone knows what splices it holds
+
+`PagedAttentionScheduler::select_completion_batch` (paged_attention/scheduler.rs:621-632) picks the
+decode batch through `completion_batch_indices` (scheduler.rs:547-579). That function reads the
+splice-carrying width of the row at the cursor as `active_staged_speculative_len()` and skips every
+row whose `active_staged_speculative_len()` differs. It applies no equivalent test on
+`active_pending_ff_tokens().len()`.
+
+With fast-forward on and no speculative proposer configured, `active_staged_speculative_len()` is 0
+for every row, so the filter is a no-op and the scheduler admits rows on token budget alone —
+including rows whose splice widths differ, and rows carrying no splice at all. One step later
+`resolve_pending_ff_batch` (speculative/staging.rs:59-68) sees a non-homogeneous batch and discards
+every splice in it, rolling each matcher back.
+
+This is not a correctness bug: round one's Defect 1 closed the correctness hole, and the discard is
+the mechanism that closes it. It is an architectural gap. Batch composition and splice viability
+are decided in two different places, the first with no knowledge of the second, and the second able
+only to say no. The round-one entries locate the concurrency limitation entirely in
+`make_completion_chunk`'s rejection of rows with differing `query_len`
+(inputs_processor.rs:1664-1670), which is where D1 (ragged widths) would fix it. That is the right
+place for the *general* fix, but it is not the only lever, and naming the window builder as the sole
+blocker understates the problem: even with ragged windows implemented, the scheduler's round-robin
+cursor will keep mixing splice-carrying rows with splice-less ones, and a splice-less row pins the
+useful width to zero unless the padding scheme handles it.
+
+The splice review's constraint 7 rules out grouping completion batches on splice *width*, and the
+reasoning is sound — splice lengths are data-dependent, so grouping on width serializes the batch to
+one sequence per step. It does not rule out the weaker predicate: preferring to co-schedule rows
+that carry a splice at all, which is a partition into two groups rather than into one group per
+observed width. Whether that is worth anything depends on the drop rate under real load, which is
+what round one's Task 6 counters were added to measure.
+
+### New C: discarding the whole splice is not the only alternative to ragged windows
+
+The round-one entries present two options for a non-homogeneous batch: drop everything (what the
+branch does), or implement ragged-width windows with padding kept out of the KV cache and out of
+`slot_mapping` (D1, deferred). There is a third that sits between them and neither entry considers.
+
+`Matcher::rollback` takes a token count. A splice of length K can be shortened to length m by
+rolling back `K - m` tokens; the first m tokens stay committed and stay valid, because they were
+forced by the grammar independently of what follows them.
+`Sequence::discard_pending_ff_tokens` (sequence.rs:1261-1279) already performs the full-length case
+of exactly this operation.
+
+So a batch in which every sequence carries a splice — the ordinary shape of a structured-output
+endpoint under load, two concurrent JSON-schema requests at different positions in their own
+grammars — can be made homogeneous by truncating every splice to the batch minimum instead of
+discarding all of them. Today that batch feeds nothing. Under truncation it feeds
+`min(K_1..K_n)` forced tokens per sequence, at the cost of one extra partial rollback per sequence
+per step and no change to the window builder, the scheduler, or the KV accounting.
+
+The case it does not help is a batch mixing grammar-constrained and unconstrained requests, where
+the minimum is zero. That case needs ragged widths, or New B's scheduling preference, or both.
+
+This is stated as an option that was not evaluated, not as a recommendation. Its cost is a partial
+rollback per sequence per step on batches that currently pay a full rollback per sequence per step,
+so the arithmetic is unlikely to be the deciding factor; the question is whether a shortened splice
+is worth the code.
+
+### New D: AnyMoE inherits the flag, and a widened window changes which expert runs
+
+`AnyMoePipeline::get_metadata` forwards the wrapped pipeline's `GeneralMetadata` unchanged
+(pipeline/amoe.rs:247-249), so an AnyMoE model built on a normal, GGUF or GGML pipeline inherits
+`supports_grammar_fast_forward: true` whenever the flag is set. No entry in the branch or in the
+round-one documents records a decision to include AnyMoE.
+
+`MoeMlp::forward` (amoe/mod.rs:258-284) takes hidden states shaped `[b, s, h]`, computes the gate,
+then reduces it with `gate.mean(1)` — the mean across the sequence dimension — and selects a single
+expert per batch row with `topk(1)` for the whole window. The shapes are correct for any `s`; there
+is no bail and no panic.
+
+The behaviour is not the same. At `s == 1`, which is every decode step without this feature, each
+generated token selects its own expert. At `s == 1 + K`, one expert serves all `1 + K` positions,
+chosen from the mean gate over a window that mixes the previously sampled token with K
+grammar-forced ones. Flag on and flag off therefore produce different expert routing, and can
+produce different output, on an AnyMoE model — silently, with no error and no counter.
+
+Two qualifications. First, this is not introduced by this branch: a staged speculative proposal
+widens the same window the same way, so AnyMoE plus MTP has the same property today. Second,
+`gate.mean(1)` is also what prefill does, so the widened decode window is adopting prefill's
+granularity rather than inventing a third behaviour. Neither qualification removes the consequence
+for this feature specifically: fast-forward is defended as an optimisation that cannot change
+output, and on AnyMoE it can, without a speculative proposer being configured and without anything
+in the gating chain saying so.
+
+### New E: the staged counter has no matching feed or drop at end of sequence
+
+`mistralrs_grammar_ff_splices_staged_total` is incremented when a splice is staged
+(sampling.rs:1630). `mistralrs_grammar_ff_tokens_fed_total` is incremented when one reaches a decode
+window (engine/mod.rs:1851). `mistralrs_grammar_ff_splice_drops_total` is incremented on discard
+(sequence.rs:1276).
+
+Within one call to `sample_and_add_toks_inner`, a splice is staged inside `sample_sequence`, and the
+sampled token is applied *after* that, by `finish_or_add_toks_to_seq`. If that token ends the
+sequence — a length cap or a stop string, not EOS, since EOS sets `ends_turn` and suppresses staging
+at sampling.rs:1619 — the sequence is finished holding a splice that is never fed and never
+discarded.
+
+`observability.mdx` documents the drop rate as
+`rate(…splice_drops_total) / rate(…splices_staged_total)`. That ratio has a denominator containing
+splices that were never eligible to be dropped, so it reads low by one splice per request that ends
+on a length cap or a stop string. On short grammar-constrained completions — the tool-call shape the
+feature is aimed at — that is not a rounding error.
+
+### Withdrawn after checking
+
+Two items written during this pass were checked against the code and do not hold:
+
+- A `return_raw_logits` request cannot interact with the `(query_len - 1, 1)` logit narrowing at
+  inputs_processor.rs:1625-1632. A raw-logits step returns from `send_raw_responses`
+  (pipeline/mod.rs:2683-2697) before reaching the `should_sample_step` gate at
+  pipeline/mod.rs:2719, so `sample_sequence` never runs for such a sequence and no splice is ever
+  staged on it. The engine's batch-uniform `return_raw_logits` assertion (engine/mod.rs:1928-1935)
+  makes the mixed case impossible as well.
+- A splice cannot survive into a prompt step. Round one's remaining-work entry already established
+  that the only `process_inputs` call passing a subset of the batch is prompt chunking, where
+  `is_prompt` holds; independently, a sequence in prompt phase has never sampled, and a preempted
+  sequence has its splice discarded at paged_attention/scheduler.rs:1386 before returning to
+  `Waiting`. The engine computing `pending_ff_batch_width` unconditionally (engine/mod.rs:1817-1826)
+  while resolving only under `!is_prompt` is therefore safe by construction rather than by check.
+
+---
 
 ## Current State
 
-- `GeneralMetadata` carries `supports_grammar_fast_forward` (`pipeline/mod.rs:1316`) and every one
-  of the 7 construction sites sets it, so pipeline enumeration is exhaustive by struct definition:
-  `normal.rs:289`, `gguf.rs:1415`, `ggml.rs:400` compute it from
-  `perf_flags::grammar_fast_forward_enabled() && !no_kv_cache && !is_xlora`; `multimodal.rs:1531`,
-  `speech.rs:330`, `diffusion.rs:252`, `embedding.rs:706` hardcode `false`.
-- `perf_flags::grammar_fast_forward_enabled()` (`perf_flags.rs:33-35`) reads
-  `MISTRALRS_GRAMMAR_FAST_FORWARD` with default `false`, memoised in a `OnceLock`, and is read once
-  per pipeline at load time — the flag is a process-wide, load-time constant with no per-request,
+- `GeneralMetadata::supports_grammar_fast_forward` (pipeline/mod.rs:1316) is set at all seven
+  construction sites: from `perf_flags::grammar_fast_forward_enabled() && !no_kv_cache && !is_xlora`
+  at normal.rs:289, gguf.rs:1415 and ggml.rs:400, and `false` at multimodal.rs:1531, speech.rs:330,
+  diffusion.rs:252 and embedding.rs:706.
+- `perf_flags::grammar_fast_forward_enabled` (perf_flags.rs:33-35) reads
+  `MISTRALRS_GRAMMAR_FAST_FORWARD` through a `OnceLock` defaulting to `false`, and each pipeline
+  reads it once at load, so the flag is a process-wide load-time constant with no per-request,
   per-model or runtime override.
-- `sample_sequence` stages a splice only inside the `SequenceRecognizer::Llguidance` arm, guarded by
-  `!llg.is_stopped() && !ends_turn` and then `supports_fast_forward && !llg.is_stopped()`
-  (`pipeline/sampling.rs:1615-1637`); `sampling.rs:1620` is the only `consume_token` call on a
-  sequence recognizer in the crate, so there is exactly one staging site.
-- `apply_pending_ff_tokens` (`pipeline/sampling.rs:724-761`) replays each staged token through
-  `finish_or_add_toks_to_seq`, which recomputes `completion_bytes` from
-  `tok_trie().decode_ext(&[token], include_special)` itself (`sampling.rs:205-207`) — the replayed
-  token's contribution to `seq.completion_bytes()` goes through the same decoder as a sampled token.
-- `resolve_pending_ff_batch` and `pending_ff_batch_width` (`speculative/staging.rs:47-68`) reuse
-  `staged_batch_state_from_widths`, whose `Homogeneous` arm requires every sequence in the batch to
-  carry a non-empty splice of identical length (`staging.rs:15-37`) — one concurrent request without
-  a splice makes the whole step fall back and drops every splice with reason `batch_shape`.
-- `make_completion_chunk` appends the splice to the decode window and narrows logit selection to
-  `(query_len - 1, 1)` while keeping the full window width in `full_query_lens` for flash-attn
-  metadata and paged slot mapping (`pipeline/inputs_processor.rs:1597-1632`, `1706-1725`).
-- Two `anyhow::bail!` guards reject a splice that reaches a window builder that does not consume it:
-  `inputs_processor.rs:1564-1571` (unresolved splice in `make_completion_chunk`) and
-  `inputs_processor.rs:2440-2451` (`make_completion_prefill_chunk`).
-- `make_completion_prefill_chunk` is reached only from `get_completion_input_windowed` when
-  `paged_attn_metadata.is_some()` (`inputs_processor.rs:2578-2591`), and the only configuration
-  setting `decode_window` above 1 is `loaders/multimodal_loaders.rs:9371`
-  (`decode_window: Some(cfg.canvas_length)`), on a loader whose pipeline sets
-  `supports_grammar_fast_forward: false` — the guard at `inputs_processor.rs:2440` is defensive
-  rather than reachable under the current gating.
-- `PagedAttentionScheduler::completion_token_cost` (`paged_attention/scheduler.rs:540-545`) and the
-  block-reservation loop (`scheduler.rs:1185-1194`) add the splice length; `_preempt`
-  (`scheduler.rs:1386`) discards it with reason `preemption`; `Sequence::reset_and_reallocate`
-  discards it with reason `realloc` (`sequence.rs:1373`).
-- `DefaultScheduler` (`scheduler/default_scheduler.rs`) admits sequences by count
-  (`DefaultSchedulerMethod::Fixed(n)`, `default_scheduler.rs:301-304`), holds no token budget and has
-  no preemption path, so it needs no splice accounting — the demo's CPU GGUF run used this scheduler,
-  not the paged one whose accounting the branch changed.
-- Speculative decoding passes `supports_fast_forward: false` at all three `sample_sequence` call
-  sites outside `sample_and_add_toks_inner` (`speculative/driver.rs:289`,
-  `speculative/verifier.rs:901`, `verifier.rs:966`), and `inputs_processor.rs:1602-1607` bails if a
-  sequence carries both — the two mechanisms are mutually exclusive by construction.
-- The branch adds 3 `#[test]` functions: `completion_batches_reserve_slots_for_pending_fast_forward_splices`
-  (`paged_attention/scheduler.rs:4118`) and two `resolve_pending_ff_batch` cases
-  (`speculative/staging.rs:150`, `staging.rs:163`).
+- `AnyMoePipeline::get_metadata` returns the wrapped pipeline's `GeneralMetadata` unchanged
+  (pipeline/amoe.rs:247-249), so an AnyMoE model over a normal, GGUF or GGML pipeline reports
+  `supports_grammar_fast_forward: true` when the flag is set.
+- `MoeMlp::forward` reduces the expert gate with `gate.mean(1)` across the sequence dimension and
+  selects one expert per batch row with `topk(1)` for the whole window (amoe/mod.rs:258-284).
+- `sampling.rs:1620` is the only `Matcher::consume_token` call on a sequence recognizer in the
+  crate, and `sampling.rs:1625` the only `consume_ff_tokens` call, so staging happens at exactly one
+  site, guarded by `!llg.is_stopped() && !ends_turn` (sampling.rs:1619) and then by
+  `supports_fast_forward && !llg.is_stopped()` and `!llg.is_error()` (sampling.rs:1624-1631).
+- `Sequence::discard_pending_ff_tokens` drops the whole splice and calls
+  `Matcher::rollback(splice.len())`, setting `SequenceState::Error` when the rollback fails
+  (sequence.rs:1261-1279).
+- `PagedAttentionScheduler::select_completion_batch` composes the decode batch through
+  `completion_batch_indices`, which filters rows on `active_staged_speculative_len()` and reads no
+  splice length (paged_attention/scheduler.rs:547-579, 621-632).
+- `DefaultScheduler` admits sequences by count under `DefaultSchedulerMethod::Fixed(n)`
+  (scheduler/default_scheduler.rs:301-304), holds no token budget and has no preemption path, so it
+  needs no splice accounting — and it is the scheduler the CPU GGUF demo ran under, not the paged
+  one whose accounting the branch changed.
+- Nine sites test for `RecurrentBatchKind::SpeculativeDecode` by name and take their other branch
+  for a fast-forward window: gdn/layer.rs:532, vision_models/qwen3_5/text.rs:850 and :2321-2324,
+  pipeline/normal.rs:2210, pipeline/multimodal.rs:1874 and :2233, vision_models/mod.rs:184 and :243,
+  pipeline/cuda_graph.rs:2379.
+- A raw-logits step returns at `send_raw_responses` (pipeline/mod.rs:2683-2697) before the
+  `should_sample_step` gate (pipeline/mod.rs:2719), so `sample_sequence` never runs for a sequence
+  with `return_raw_logits` set and no splice is staged on one.
+- The branch adds three `#[test]` functions:
+  `completion_batches_reserve_slots_for_pending_fast_forward_splices`
+  (paged_attention/scheduler.rs:4118), `resolve_pending_ff_batch_discards_mismatched_splice_widths`
+  (speculative/staging.rs:150) and `resolve_pending_ff_batch_keeps_equal_width_splices`
+  (speculative/staging.rs:163).
 
 ## Missing
 
-- `recurrent_batch_kind_for_input(is_prompt, has_staged_speculative_batch)` (`pipeline/mod.rs:733-744`)
-  takes no fast-forward argument, and none of its 7 call sites
-  (`pipeline/inputs_processor.rs:2813`, `vision_models/gemma4/inputs_processor.rs:1689`,
-  `qwen2_5_vl/inputs_processor.rs:414`, `qwen2vl/inputs_processor.rs:979`,
-  `qwen3_vl/inputs_processor.rs:1080` and `:1657`) pass one — a fast-forward decode window of width
-  greater than 1 is labelled `RecurrentBatchKind::Decode`, the same label a width-1 decode carries.
-- Two `RecurrentBatchKind::Decode` sites were changed to tolerate `seq_len > 1` by relaxing a bail
-  into a width test (`gdn/backend.rs:834`, `models/granite.rs:944`), while `models/lfm2.rs:768`
-  already carried the same `&& seq_len == 1` shape before the branch — the branch fixes two of the
-  three recurrent single-token assumptions reachable under the `Decode` label and adds no test for
-  either.
-- Sites that admit a multi-token recurrent window only under `RecurrentBatchKind::SpeculativeDecode`
-  are unreached by a fast-forward window: `gdn/layer.rs:532` (CUDA speculative checkpoint path),
-  `vision_models/qwen3_5/text.rs:850` (`should_stash_gdn_replay`), `qwen3_5/text.rs:2321-2324`
-  (`speculative_gdn`, gating `transition_gdn`), `pipeline/normal.rs:2210`
-  (`snapshot_hybrid_recurrent_checkpoints`, `transitions_supported`), `pipeline/multimodal.rs:1874`
-  and `:2233`, `vision_models/mod.rs:184` and `:243`.
-- `qwen3_5/text.rs:2340-2346` gates `deferred_gdn` on `query_len == 1` and
-  `batch_kind() == RecurrentBatchKind::Decode`; a width-`n` fast-forward window on a hybrid GDN model
-  fails that test and falls to `flush_deferred_recurrent_state`, with `candle_core::bail!("Qwen3.5
-  deferred recurrent state cannot be materialized")` on failure — the path is unreachable on the
-  demo's CPU build.
-- `PagedAttentionScheduler::completion_batch_indices` (`paged_attention/scheduler.rs:547-579`) selects
-  a decode batch by requiring `active_staged_speculative_len() == staged_width` and applies no
-  equivalent filter on splice width, so the scheduler co-schedules sequences whose splice widths
-  differ; `resolve_pending_ff_batch` then discards every splice in that step
-  (`speculative/staging.rs:59-68`).
+- No site makes any of the nine `RecurrentBatchKind::SpeculativeDecode` tests fire for a
+  fast-forward window, so a hybrid-recurrent model takes the general recurrent path on every splice
+  step: `snapshot_hybrid_recurrent_checkpoints` snapshots rather than returning `Ok(None)`
+  (pipeline/normal.rs:2210-2216), and `vision_models/qwen3_5/text.rs:2325-2340` applies pending
+  recurrent transitions eagerly rather than through `transition_gdn`.
+- `completion_batch_indices` applies no splice-width or carries-a-splice predicate
+  (paged_attention/scheduler.rs:547-579), so batch composition admits rows that
+  `resolve_pending_ff_batch` then forces into a whole-batch discard
+  (speculative/staging.rs:59-68).
+- No code shortens a splice: `Sequence::discard_pending_ff_tokens` rolls back `splice.len()` and
+  takes the whole vector (sequence.rs:1261-1263), and `Matcher::rollback` accepts any count, so a
+  partial rollback to the batch-minimum width has no caller.
+- No test covers `apply_pending_ff_tokens` (pipeline/sampling.rs:724), the splice branch of
+  `make_completion_chunk` (inputs_processor.rs:1597-1632), the `full_query_lens` substitutions
+  (inputs_processor.rs:1706-1725), either `anyhow::bail!` guard (inputs_processor.rs:1564-1571,
+  2440-2451), or the `Matcher::rollback` half of `discard_pending_ff_tokens` (sequence.rs:1261-1279).
+- No test asserts that flag-on and flag-off produce identical tokens for a fixed grammar and seed;
+  `ff_bench.py` pins both runs to the same string by construction under a fully forcing regex at
+  `temperature=0.0` (branch `ff-demo-artifacts`, `ff_bench.py`, `RESULTS.md`).
 - `MISTRALRS_GRAMMAR_FAST_FORWARD` has no counterpart in `mistralrs-cli/src/args/mod.rs`,
   `mistralrs-pyo3/mistralrs.pyi`, `mistralrs-server-core/src/mistralrs_for_server_builder.rs` or the
-  `mistralrs/src/` builder surface, all of which `bea02b2c4` extended for its decode-behaviour change.
-- No test covers `apply_pending_ff_tokens` (`pipeline/sampling.rs:724`), the splice branch of
-  `make_completion_chunk` (`inputs_processor.rs:1597-1632`), the `full_query_lens` substitutions
-  (`inputs_processor.rs:1706-1725`), either `anyhow::bail!` guard, or the matcher rollback in
-  `discard_pending_ff_tokens` (`sequence.rs:1261-1279`); `sampling.rs`, `inputs_processor.rs` and
-  `sequence.rs` gain 0 tests between them while carrying 11, 17 and 42 existing ones.
-- No test asserts the property `RESULTS.md` measures by hand — that flag-on and flag-off produce
-  byte-identical completions for a fixed grammar and seed.
+  `mistralrs/src/` builder surface, all of which `bea02b2c4` extended for its decode-shape change.
 
 ## Divergence
 
-- `docs/src/content/docs/guides/serve/structured-output.mdx` states fast-forward "is not available
-  under X-LoRA or for multimodal pipelines" and names `--no-kv-cache`; it does not state that speech,
-  diffusion and embedding pipelines set the flag `false`, nor that speculative decoding disables it.
-- `docs/src/content/docs/reference/environment-variables.md:64` lists
-  `MISTRALRS_GRAMMAR_FAST_FORWARD` in the "Server and UI" table, and
-  `structured-output.mdx` links to `/reference/environment-variables/#server-and-ui`, while the two
-  existing `perf_flags.rs` entries are listed under "CUDA acceleration" (`environment-variables.md:70`,
-  `:73`).
+- `structured-output.mdx` states fast-forward "is not available under X-LoRA or for multimodal
+  pipelines" and names `--no-kv-cache`; an AnyMoE model over a normal, GGUF or GGML pipeline is
+  available to it through `AnyMoePipeline::get_metadata` (pipeline/amoe.rs:247-249), and
+  `MoeMlp::forward` selects one expert for a whole widened window (amoe/mod.rs:263-267) where a
+  width-1 window selects one per token.
+- `observability.mdx` documents the drop rate as
+  `sum(rate(mistralrs_grammar_ff_splice_drops_total[5m])) / sum(rate(mistralrs_grammar_ff_splices_staged_total[5m]))`;
+  a splice staged at sampling.rs:1630 on the step whose sampled token finishes the sequence through
+  a length cap or a stop string is neither fed nor discarded, so the denominator counts splices the
+  numerator can never count.
+- `structured-output.mdx` states "Span length tracks each request's own position in its own grammar,
+  so two concurrent grammar-constrained requests ordinarily agree on nothing, and the batch falls
+  back to the flag-off baseline for that step", presenting the whole-batch discard as a property of
+  splice lengths; the discard is also a property of `completion_batch_indices` composing the batch
+  without reading splice lengths (paged_attention/scheduler.rs:547-579) and of
+  `discard_pending_ff_tokens` having no partial-rollback caller (sequence.rs:1261-1263).
 - `throughput-tuning.mdx:163` describes the `perf_flags.rs` env switches as existing "only for
-  debugging and benchmarking comparisons"; `MISTRALRS_GRAMMAR_FAST_FORWARD` is the sole entry in that
-  file that defaults to off and is the only way to turn a behaviour on.
-- `RESULTS.md` reports 6.1-6.2x on a grammar where 100% of the completion is forced and states the
-  tool-call case (~3%) is "not reproduced here"; `structured-output.mdx` and
-  `throughput-tuning.mdx:67` carry the qualitative shape of that result but the branch carries no
-  measurement of the mixed-grammar case.
+  debugging and benchmarking comparisons"; `MISTRALRS_GRAMMAR_FAST_FORWARD` is the only entry in
+  that file that defaults to off and is the only way to turn a behaviour on.
+- `environment-variables.md:64` lists `MISTRALRS_GRAMMAR_FAST_FORWARD` in the "Server and UI" table
+  and `structured-output.mdx` links to `/reference/environment-variables/#server-and-ui`, while the
+  two existing `perf_flags.rs` entries are listed under "CUDA acceleration"
+  (environment-variables.md:70, :73).
 
 ## Unverified
 
-- Whether a width-`n` fast-forward window labelled `RecurrentBatchKind::Decode` produces correct
-  recurrent state on a hybrid GDN model (Qwen3.5 non-GGUF, Qwen3-Next, LFM2, Granite Mamba), or only
-  a slower path — established here is that the label differs from the speculative case, not that the
-  numerics differ.
-- Whether `CudaDecodeGraphKey` (`pipeline/cuda_graph.rs:1074-1133`) distinguishes a width-`n`
-  fast-forward window from a width-`n` speculative one: `input_shape` differs from a width-1 decode,
-  and `recurrent_batch_kind` is part of the key, so a shape collision is not established;
-  `DecodePagedRows::one_token_continuation` requires `q_len == 1` (`cuda_graph.rs:596-611`) and skips
-  fast-forward windows.
-- Whether `AnyMoePipeline` inherits `supports_grammar_fast_forward: true` in practice — it forwards
-  the wrapped pipeline's `GeneralMetadata` unchanged (`pipeline/amoe.rs:247-249`), so a wrapped
-  normal/GGUF/GGML pipeline enables it, and no AnyMoE gating layer was inspected for multi-token
-  decode-window handling.
-- Whether a `return_raw_logits` request can carry a grammar: `make_completion_chunk` takes no
-  `return_raw_logits` parameter and narrows `context_lens` to `(query_len - 1, 1)` whenever a splice
-  is present (`inputs_processor.rs:1625-1632`), while the engine asserts batch-uniform
-  `return_raw_logits` (`engine/mod.rs:1928-1935`).
-- Whether `pending_ff_batch_width` can be non-`None` on a prompt step: the engine computes it
-  unconditionally and calls `resolve_pending_ff_batch` only when `!is_prompt`
-  (`engine/mod.rs:1817-1826`), so a splice surviving into a prompt step would add to
-  `scheduled_token_counts` while `get_prompt_input` ignores it.
-- Whether the staged/fed/dropped counters balance: a splice staged at `sampling.rs:1631` on a step
-  whose sampled token finishes the sequence is neither fed nor discarded, so
-  `mistralrs_grammar_ff_splices_staged_total` can exceed fed-plus-dropped by one per finished
-  grammar-constrained request.
-- Whether the `any_finished` bifurcation in `sample_and_add_toks_inner`
-  (`pipeline/sampling.rs:872-925`) is reachable with the CUDA batched sampler:
-  `cuda_token_sampling_plan` returns `None` for any sequence with a non-`None` recognizer
-  (`sampling.rs:1025-1032`), so a batch containing a grammar-constrained sequence never takes
-  `try_sample_batch_cuda`.
+- Whether the general recurrent path that the nine `SpeculativeDecode` sites fall through to is
+  numerically correct for a fast-forward window as well as slower. Established here is which branch
+  is taken, not what it computes. Needs a CUDA build, the same blocker as round one's F3 and R1.
+- Whether AnyMoE expert routing actually diverges in output between flag on and flag off, as opposed
+  to selecting the same expert in practice because the gate is dominated by the sampled token.
+  Established here is that the selection granularity differs. Needs an AnyMoE model, a grammar and
+  the flag.
+- Whether truncating splices to the batch minimum recovers a useful fraction of the feature under
+  concurrent grammar load. Needs `mistralrs_grammar_ff_splice_drops_total{reason="batch_shape"}`
+  under real traffic, which is round one's Task 6 dependency for D1 as well.
