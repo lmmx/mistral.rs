@@ -1528,7 +1528,10 @@ impl Loader for MultimodalLoader {
                 model_metadata: Some(model_metadata),
                 modalities,
                 loaded_for_uqff_write: self.config.write_uqff.is_some(),
-                supports_grammar_fast_forward: false,
+                supports_grammar_fast_forward: crate::pipeline::ff_metrics::resolve_support(
+                    false,
+                    false,
+                ),
             }),
             processor,
             prefixer: self.inner.prefixer(&config),
