@@ -1857,6 +1857,31 @@ impl Engine {
                             })
                             .collect::<Vec<_>>();
 
+                        // A widened FF window bypasses GDN's deferred-decode fast path (seq_len != 1),
+                        // so flush pending deferred state first or the next ordinary step reads it
+                        // against an already-advanced recurrent_state.
+                        if pending_ff_width.is_some() {
+                            let ff_seq_ids: Vec<usize> =
+                                guards_mut.iter().map(|seq| *seq.id()).collect();
+                            tracing::debug!(
+                                ?ff_seq_ids,
+                                "ff_trace: about to call flush_recurrent_speculative_transitions"
+                            );
+                            let ff_recurrent_flush = get_mut_arcmutex!(self.pipeline)
+                                .flush_recurrent_speculative_transitions(&ff_seq_ids);
+                            handle_pipeline_forward_error!(
+                                "grammar fast-forward recurrent-state flush",
+                                ff_recurrent_flush,
+                                &mut guards_mut,
+                                self.pipeline,
+                                'lp,
+                                self.prefix_cacher
+                            );
+                            tracing::debug!(
+                                "ff_trace: flush_recurrent_speculative_transitions returned Ok"
+                            );
+                        }
+
                         let res = {
                             let mut pipeline = get_mut_arcmutex!(self.pipeline);
 

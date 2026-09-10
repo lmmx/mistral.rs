@@ -1672,6 +1672,7 @@ impl Qwen3_5TextModel {
         slots: Option<&[u32]>,
     ) -> Result<bool> {
         if !cache.uses_gdn_deferred_state() {
+            tracing::debug!("ff_trace: flush_deferred_recurrent_state: cache does not use gdn deferred state");
             return Ok(false);
         }
         let host_slots = slots.map(|slots| {
@@ -1684,7 +1685,9 @@ impl Qwen3_5TextModel {
             slots.dedup();
             slots
         });
+        tracing::debug!(?host_slots, "ff_trace: flush_deferred_recurrent_state: resolved host_slots");
         if host_slots.as_ref().is_some_and(Vec::is_empty) {
+            tracing::debug!("ff_trace: flush_deferred_recurrent_state: host_slots empty, no-op");
             return Ok(true);
         }
         let mut flushed = false;
@@ -1707,11 +1710,20 @@ impl Qwen3_5TextModel {
                         )
                     })?,
             };
-            if !gdn.flush_deferred_state(pool, &active_slots, self.dtype)? {
+            let layer_flushed = gdn.flush_deferred_state(pool, &active_slots, self.dtype)?;
+            if layer_idx == 0 || !layer_flushed {
+                tracing::debug!(
+                    layer_idx,
+                    layer_flushed,
+                    "ff_trace: flush_deferred_recurrent_state: per-layer flush result"
+                );
+            }
+            if !layer_flushed {
                 return Ok(false);
             }
             flushed = true;
         }
+        tracing::debug!(flushed, "ff_trace: flush_deferred_recurrent_state: done");
         Ok(flushed)
     }
 
@@ -1740,6 +1752,12 @@ impl Qwen3_5TextModel {
     ) -> Result<()> {
         let cache = self.cache.hybrid();
         let slots = cache.recurrent_slots_for_sequences(sequence_ids);
+        tracing::debug!(
+            ?sequence_ids,
+            ?slots,
+            uses_gdn_deferred_state = cache.uses_gdn_deferred_state(),
+            "ff_trace: flush_recurrent_transitions_for_sequences: entry"
+        );
         if cache.uses_recurrent_transition_log()
             && !self.apply_pending_recurrent_transitions_with_cache(&cache, &slots)?
             && !slots.is_empty()
