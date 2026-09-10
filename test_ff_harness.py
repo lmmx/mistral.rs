@@ -9,6 +9,7 @@ Run with: python3 -m unittest test_ff_harness -v
 
 from __future__ import annotations
 
+import ast
 import collections
 import concurrent.futures
 import contextlib
@@ -26,6 +27,7 @@ import threading
 import time
 import types
 import unittest
+import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -736,6 +738,187 @@ class CompareCaptureTest(unittest.TestCase):
         self.assertIn("## Capture", text)
         self.assertIn("layer=0,row=0", text)
         self.assertIn("Verdict:", text)
+
+
+class _StubExpertType:
+    """Stands in for pyo3's complex enum: variants are constructed by calling them."""
+
+    class FineTuned:
+        def __init__(self):
+            self.kind = "FineTuned"
+
+        def __eq__(self, other):
+            return isinstance(other, type(self))
+
+    class LoraAdapter:
+        def __init__(self, rank, alpha, target_modules):
+            self.kind = "LoraAdapter"
+            self.rank, self.alpha, self.target_modules = rank, alpha, target_modules
+
+
+class _StubAnyMoeConfig:
+    def __init__(self, hidden_size, dataset_json, prefix, mlp, model_ids, expert_type,
+                 layers=(), lr=1e-3, epochs=100, batch_size=4, gate_model_id=None,
+                 training=True, loss_csv_path=None):
+        self.__dict__.update(locals())
+        del self.__dict__["self"]
+
+
+class _StubMistralrs:
+    AnyMoeExpertType = _StubExpertType
+    AnyMoeConfig = _StubAnyMoeConfig
+
+
+BASE_ANYMOE_CONFIG = {
+    "hidden_size": 1024,
+    "dataset_json": "examples/amoe.json",
+    "prefix": "model.layers",
+    "mlp": "mlp",
+    "model_ids": ["Qwen/Qwen3-0.6B"],
+    "expert_type": "fine_tuned",
+}
+
+
+class AnyMoeConfigTest(unittest.TestCase):
+    """F8: --anymoe-config-json must build a real AnyMoeConfig, expert_type pyclass included."""
+
+    def build(self, **overrides):
+        config = dict(BASE_ANYMOE_CONFIG)
+        config.update(overrides)
+        return ffh.build_anymoe_config(_StubMistralrs, config)
+
+    def test_fine_tuned_string_builds_the_variant(self):
+        built = self.build()
+        self.assertIsInstance(built.expert_type, _StubExpertType.FineTuned)
+
+    def test_required_fields_are_passed_through(self):
+        built = self.build()
+        self.assertEqual(built.hidden_size, 1024)
+        self.assertEqual(built.dataset_json, "examples/amoe.json")
+        self.assertEqual(built.prefix, "model.layers")
+        self.assertEqual(built.mlp, "mlp")
+        self.assertEqual(built.model_ids, ["Qwen/Qwen3-0.6B"])
+
+    def test_optional_fields_reach_the_constructor(self):
+        # plan 03 Part B cuts layers to [0, 1, 2] and epochs to 25
+        built = self.build(layers=[0, 1, 2], epochs=25)
+        self.assertEqual(built.layers, [0, 1, 2])
+        self.assertEqual(built.epochs, 25)
+        self.assertEqual(built.batch_size, 4)  # untouched default
+
+    def test_fine_tuned_object_form(self):
+        built = self.build(expert_type={"type": "FineTuned"})
+        self.assertIsInstance(built.expert_type, _StubExpertType.FineTuned)
+
+    def test_lora_adapter_variant_is_built_with_its_fields(self):
+        built = self.build(expert_type={
+            "type": "lora_adapter", "rank": 16, "alpha": 32, "target_modules": ["q_proj", "v_proj"],
+        })
+        expert = built.expert_type
+        self.assertIsInstance(expert, _StubExpertType.LoraAdapter)
+        self.assertEqual(expert.rank, 16)
+        self.assertIsInstance(expert.alpha, float)
+        self.assertEqual(expert.alpha, 32.0)
+        self.assertEqual(expert.target_modules, ["q_proj", "v_proj"])
+
+    def test_variant_naming_is_forgiving(self):
+        for spelling in ("fine_tuned", "FineTuned", "fine-tuned", "finetuned"):
+            self.assertIsInstance(
+                self.build(expert_type=spelling).expert_type, _StubExpertType.FineTuned)
+
+    def test_a_raw_json_expert_type_no_longer_reaches_the_constructor(self):
+        """The pre-fix behaviour passed this straight through and raised TypeError in pyo3."""
+        built = self.build()
+        self.assertNotIsInstance(built.expert_type, (str, dict))
+
+    def test_unknown_variant_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.build(expert_type="mixture_of_depths")
+        self.assertIn("unknown expert_type", str(ctx.exception))
+
+    def test_fine_tuned_with_stray_fields_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.build(expert_type={"type": "fine_tuned", "rank": 8})
+
+    def test_lora_adapter_missing_a_field_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.build(expert_type={"type": "lora_adapter", "rank": 8})
+        self.assertIn("missing", str(ctx.exception))
+
+    def test_lora_adapter_unknown_field_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.build(expert_type={"type": "lora_adapter", "rank": 8, "alpha": 1.0,
+                                    "target_modules": [], "dropout": 0.1})
+
+    def test_missing_required_key_is_rejected(self):
+        config = dict(BASE_ANYMOE_CONFIG)
+        del config["hidden_size"]
+        with self.assertRaises(ValueError) as ctx:
+            ffh.build_anymoe_config(_StubMistralrs, config)
+        self.assertIn("hidden_size", str(ctx.exception))
+
+    def test_a_typo_is_rejected_rather_than_silently_defaulted(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.build(epoch=25)
+        self.assertIn("epoch", str(ctx.exception))
+
+    def test_expert_type_must_be_a_string_or_object(self):
+        with self.assertRaises(ValueError):
+            self.build(expert_type=["fine_tuned"])
+
+    def test_config_must_be_an_object(self):
+        with self.assertRaises(ValueError):
+            ffh.build_anymoe_config(_StubMistralrs, ["not", "an", "object"])
+
+    def test_a_full_json_file_round_trips(self):
+        config = dict(BASE_ANYMOE_CONFIG, layers=[0, 1, 2], epochs=25)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "amoe.json"
+            path.write_text(json.dumps(config))
+            built = ffh.build_anymoe_config(_StubMistralrs, json.loads(path.read_text()))
+        self.assertIsInstance(built.expert_type, _StubExpertType.FineTuned)
+        self.assertEqual(built.layers, [0, 1, 2])
+
+
+class AnyMoeApiSurfaceTest(unittest.TestCase):
+    """The key lists must match the real API, read from the wheel committed on this branch."""
+
+    @staticmethod
+    def _stub_source():
+        wheels = sorted(HERE.glob("mistralrs-*.whl"))
+        if not wheels:
+            raise unittest.SkipTest("no mistralrs wheel committed on this branch")
+        with zipfile.ZipFile(wheels[0]) as zf:
+            return zf.read("mistralrs/__init__.pyi").decode("utf-8")
+
+    def _class_def(self, name):
+        tree = ast.parse(self._stub_source())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == name:
+                return node
+        self.fail(f"{name} not found in the shipped stub")
+
+    def test_config_keys_match_the_shipped_signature(self):
+        init = next(n for n in self._class_def("AnyMoeConfig").body
+                    if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+        params = [a.arg for a in init.args.args if a.arg != "self"]
+        self.assertEqual(set(params),
+                         set(ffh.ANYMOE_REQUIRED_KEYS) | set(ffh.ANYMOE_OPTIONAL_KEYS))
+        required = params[:len(init.args.args) - 1 - len(init.args.defaults)]
+        self.assertEqual(set(required), set(ffh.ANYMOE_REQUIRED_KEYS))
+
+    def test_expert_type_variants_match_the_shipped_stub(self):
+        variants = {n.name: n for n in self._class_def("AnyMoeExpertType").body
+                    if isinstance(n, ast.ClassDef)}
+        self.assertEqual(set(variants), {"FineTuned", "LoraAdapter"})
+        lora_fields = [n.target.id for n in variants["LoraAdapter"].body
+                       if isinstance(n, ast.AnnAssign)]
+        self.assertEqual(lora_fields, list(ffh.LORA_ADAPTER_FIELDS))
+
+    def test_the_stub_used_by_the_other_tests_matches_that_surface(self):
+        variants = {n.name for n in self._class_def("AnyMoeExpertType").body
+                    if isinstance(n, ast.ClassDef)}
+        self.assertTrue(variants <= set(vars(_StubExpertType)))
 
 
 def _free_port() -> int:

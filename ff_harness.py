@@ -366,6 +366,80 @@ def aggregate_capture(mode: str, capture: dict[str, Any], args: argparse.Namespa
         )
 
 
+# mistralrs-pyo3/src/anymoe.rs:52-80. `expert_type` is a pyo3 complex enum, not a string or a dict,
+# so a JSON file cannot hold one directly: it names a variant and the harness constructs it.
+ANYMOE_REQUIRED_KEYS = ("hidden_size", "dataset_json", "prefix", "mlp", "model_ids", "expert_type")
+ANYMOE_OPTIONAL_KEYS = (
+    "layers", "lr", "epochs", "batch_size", "gate_model_id", "training", "loss_csv_path"
+)
+EXPERT_TYPE_FINE_TUNED = "finetuned"
+EXPERT_TYPE_LORA_ADAPTER = "loraadapter"
+LORA_ADAPTER_FIELDS = ("rank", "alpha", "target_modules")
+
+
+def _normalise_variant(name: Any) -> str:
+    return str(name).replace("_", "").replace("-", "").lower()
+
+
+def build_expert_type(mistralrs: Any, spec: Any) -> Any:
+    """Turn `expert_type` from the JSON config into an `AnyMoeExpertType` variant.
+
+    Accepts the bare string `"fine_tuned"` or an object naming the variant under `type`:
+    `{"type": "lora_adapter", "rank": 16, "alpha": 16.0, "target_modules": ["q_proj"]}`.
+    """
+    if isinstance(spec, str):
+        spec = {"type": spec}
+    if not isinstance(spec, dict):
+        raise ValueError(f"expert_type must be a string or an object, got {type(spec).__name__}")
+
+    fields = dict(spec)
+    variant = fields.pop("type", None)
+    if variant is None:
+        raise ValueError("expert_type object needs a 'type' naming the variant")
+
+    kind = _normalise_variant(variant)
+    if kind == EXPERT_TYPE_FINE_TUNED:
+        if fields:
+            raise ValueError(f"expert_type FineTuned takes no fields, got {sorted(fields)}")
+        return mistralrs.AnyMoeExpertType.FineTuned()
+    if kind == EXPERT_TYPE_LORA_ADAPTER:
+        missing = [f for f in LORA_ADAPTER_FIELDS if f not in fields]
+        if missing:
+            raise ValueError(f"expert_type LoraAdapter is missing {missing}")
+        unknown = sorted(set(fields) - set(LORA_ADAPTER_FIELDS))
+        if unknown:
+            raise ValueError(f"expert_type LoraAdapter got unknown fields {unknown}")
+        return mistralrs.AnyMoeExpertType.LoraAdapter(
+            rank=int(fields["rank"]),
+            alpha=float(fields["alpha"]),
+            target_modules=list(fields["target_modules"]),
+        )
+    raise ValueError(
+        f"unknown expert_type {variant!r}; expected fine_tuned or lora_adapter"
+    )
+
+
+def build_anymoe_config(mistralrs: Any, config: dict[str, Any]) -> Any:
+    """Build a real `AnyMoeConfig` from the parsed `--anymoe-config-json` file.
+
+    Unknown keys are an error rather than a silent default: `"epoch": 25` instead of `"epochs"`
+    would otherwise train for the default 100 and nothing would say so.
+    """
+    if not isinstance(config, dict):
+        raise ValueError(f"anymoe config must be a JSON object, got {type(config).__name__}")
+
+    missing = [key for key in ANYMOE_REQUIRED_KEYS if key not in config]
+    if missing:
+        raise ValueError(f"anymoe config is missing required keys {missing}")
+    unknown = sorted(set(config) - set(ANYMOE_REQUIRED_KEYS) - set(ANYMOE_OPTIONAL_KEYS))
+    if unknown:
+        raise ValueError(f"anymoe config has unknown keys {unknown}")
+
+    kwargs = {key: value for key, value in config.items() if key != "expert_type"}
+    kwargs["expert_type"] = build_expert_type(mistralrs, config["expert_type"])
+    return mistralrs.AnyMoeConfig(**kwargs)
+
+
 def build_plain_runner(args: argparse.Namespace):
     import mistralrs
 
@@ -385,7 +459,7 @@ def build_plain_runner(args: argparse.Namespace):
     runner_kwargs: dict[str, Any] = dict(which=which, seed=args.seed)
     if args.anymoe_config_json:
         anymoe_cfg = json.loads(Path(args.anymoe_config_json).read_text())
-        runner_kwargs["anymoe_config"] = mistralrs.AnyMoeConfig(**anymoe_cfg)
+        runner_kwargs["anymoe_config"] = build_anymoe_config(mistralrs, anymoe_cfg)
 
     return mistralrs.Runner(**runner_kwargs)
 
@@ -1105,7 +1179,10 @@ def add_common_request_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--out-dir", default=str(DEFAULT_REPORT_DIR))
     p.add_argument("--label", default=None)
     p.add_argument("--anymoe-config-json", default=None,
-                    help="routing-log mode only: JSON file with AnyMoeConfig kwargs")
+                    help="routing-log mode only: JSON file of AnyMoeConfig kwargs. Required: "
+                         f"{', '.join(ANYMOE_REQUIRED_KEYS)}. `expert_type` names a variant, "
+                         'either "fine_tuned" or {"type": "lora_adapter", "rank": ..., '
+                         '"alpha": ..., "target_modules": [...]}.')
     p.add_argument("--rust-log", default=None,
                     help="value for RUST_LOG in this run. Overrides the default, which leaves "
                          "logging alone for --mode equality and sets MISTRALRS_DEBUG=1 for the "
