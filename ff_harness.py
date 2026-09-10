@@ -35,6 +35,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import statistics
 import subprocess
 import sys
@@ -63,6 +64,19 @@ DEFAULT_ARMS_PATTERN = r"\bARM\b"
 
 METRIC_PREFIX = "mistralrs_grammar_ff_"
 METRIC_LINE_RE = re.compile(r"^(" + re.escape(METRIC_PREFIX) + r"\S*)\s+(\S+)\s*$")
+
+
+def parse_server_cmd(raw: str) -> list[str]:
+    """Split a `--server-cmd` string into an argv list.
+
+    One shell-quoted string rather than `nargs="+"`: argparse stops consuming a `+` list at the
+    first token starting with `-`, so a normal server command line (`mistralrs serve -p 1234 -m X`)
+    could not be passed at all.
+    """
+    argv = shlex.split(raw)
+    if not argv:
+        raise ValueError("--server-cmd is empty after shell splitting")
+    return argv
 
 
 def utc_stamp() -> str:
@@ -483,8 +497,8 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
 
     base_url = f"http://{args.server_host}:{args.server_port}"
 
-    server_cmd = args.server_cmd
-    print(f"--- launching server: {' '.join(server_cmd)} ---", file=sys.stderr)
+    server_cmd = parse_server_cmd(args.server_cmd)
+    print(f"--- launching server: {shlex.join(server_cmd)} ---", file=sys.stderr)
     proc = subprocess.Popen(server_cmd, env=env)
     try:
         wait_for_health(base_url, args.startup_timeout_seconds)
@@ -536,6 +550,7 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
         "flag_env_value": env.get(FF_ENV_VAR, "<unset>"),
         "timestamp_utc": utc_stamp(),
         "server_cmd": server_cmd,
+        "server_cmd_raw": args.server_cmd,
         "base_url": base_url,
         "num_requests": n,
         "num_unconstrained": n_unconstrained,
@@ -618,8 +633,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--mode", choices=ALL_MODES, required=True)
     p_run.add_argument("--flag", choices=("on", "off", "unset"), required=True)
     add_common_request_args(p_run)
-    p_run.add_argument("--server-cmd", nargs="+", default=None,
-                        help="concurrency mode only: full command to launch the HTTP server")
+    p_run.add_argument("--server-cmd", default=None,
+                        help="concurrency mode only: the full server command line as ONE "
+                             "shell-quoted string, split with shlex, e.g. "
+                             "--server-cmd 'mistralrs serve -p 1234 -m <model> --paged-attn'")
     p_run.add_argument("--server-host", default="127.0.0.1")
     p_run.add_argument("--server-port", type=int, default=11434)
     p_run.add_argument("--startup-timeout-seconds", type=float, default=120.0)
@@ -642,8 +659,13 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.command == "run" and args.mode == "concurrency" and not args.server_cmd:
-        parser.error("--server-cmd is required for --mode concurrency")
+    if args.command == "run" and args.mode == "concurrency":
+        if not args.server_cmd:
+            parser.error("--server-cmd is required for --mode concurrency")
+        try:
+            parse_server_cmd(args.server_cmd)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     args.func(args)
 
