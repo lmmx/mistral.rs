@@ -515,7 +515,16 @@ class ConcurrencyRequestResult:
     error: str | None = None
 
 
-def build_concurrency_request_body(prompt: str, max_tokens: int, schema: str | None) -> dict[str, Any]:
+def build_concurrency_request_body(
+    prompt: str, max_tokens: int, schema: dict[str, Any] | None, seed: int | None = None
+) -> dict[str, Any]:
+    """Build one OpenAI-route body.
+
+    The HTTP route is not the Python `ChatCompletionRequest`: `openai.rs` has no `grammar_type`
+    field and its `grammar` is `#[serde(tag = "type", content = "value")]`, so the schema goes in
+    as a nested object under `{"type": "json_schema", "value": ...}`. `seed` is a real field on
+    that struct (`openai.rs:1180`, covered by its own test at `:2139`).
+    """
     body: dict[str, Any] = {
         "model": "default",
         "messages": [{"role": "user", "content": prompt}],
@@ -523,9 +532,10 @@ def build_concurrency_request_body(prompt: str, max_tokens: int, schema: str | N
         "temperature": 0.0,
         "enable_thinking": False,
     }
+    if seed is not None:
+        body["seed"] = seed
     if schema is not None:
-        body["grammar_type"] = "json_schema"
-        body["grammar"] = schema
+        body["grammar"] = {"type": "json_schema", "value": schema}
     return body
 
 
@@ -565,7 +575,7 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
     try:
         wait_for_health(base_url, args.startup_timeout_seconds)
 
-        schemas = [Path(p).read_text() for p in schema_files]
+        schemas = [json.loads(Path(p).read_text()) for p in schema_files]
 
         n = args.num_requests
         n_unconstrained = round(n * args.unconstrained_fraction)

@@ -220,5 +220,27 @@ class SchemaSetTest(unittest.TestCase):
             ])
 
 
+class RequestBodyTest(unittest.TestCase):
+    """The HTTP route's grammar field is a tagged object, not the Python API's flat string pair."""
+
+    def test_constrained_body_uses_the_tagged_grammar_object(self):
+        schema = json.loads(ffh.DEFAULT_SCHEMA_FIXTURE.read_text())
+        body = ffh.build_concurrency_request_body("hi", 16, schema)
+        self.assertEqual(body["grammar"], {"type": "json_schema", "value": schema})
+        self.assertNotIn("grammar_type", body)
+
+    def test_unconstrained_body_carries_no_grammar(self):
+        body = ffh.build_concurrency_request_body("hi", 16, None)
+        self.assertNotIn("grammar", body)
+
+    def test_body_is_json_serialisable(self):
+        schema = json.loads(ffh.DEFAULT_SCHEMA_FIXTURE.read_text())
+        json.dumps(ffh.build_concurrency_request_body("hi", 16, schema, seed=7))
+
+    def test_seed_is_only_sent_when_given(self):
+        self.assertEqual(ffh.build_concurrency_request_body("hi", 16, None, seed=7)["seed"], 7)
+        self.assertNotIn("seed", ffh.build_concurrency_request_body("hi", 16, None))
+
+
 if __name__ == "__main__":
     unittest.main()
