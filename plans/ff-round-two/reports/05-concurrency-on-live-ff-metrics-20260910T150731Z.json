@@ -1,0 +1,83 @@
+{
+  "base_url": "http://127.0.0.1:1235",
+  "flag_env_value": "1",
+  "flag_requested": "on",
+  "latency_summary_s": {
+    "count_failed": 0,
+    "count_ok": 2,
+    "max": 0.27282170101534575,
+    "mean": 0.2702294129994698,
+    "median": 0.2702294129994698,
+    "min": 0.2676371249835938
+  },
+  "max_tokens": 32,
+  "metric_prefixes": [
+    "mistralrs_grammar_ff_"
+  ],
+  "metrics_after": {},
+  "metrics_before": {},
+  "metrics_delta": {},
+  "mode": "concurrency",
+  "num_requests": 2,
+  "num_unconstrained": 0,
+  "plan": "05",
+  "prompt": "Report the status of the last deployment. Respond with only the requested JSON object.",
+  "request_seed_sent": 42,
+  "requests": [
+    {
+      "constrained": true,
+      "error": null,
+      "finish_reason": "length",
+      "index": 0,
+      "latency_s": 0.2676371249835938,
+      "ok": true,
+      "scheduled_offset_s": 0.0,
+      "schema_file": "/home/louis/tmp/mistral.rs/plans/ff-round-two/fixtures/partial.schema.json",
+      "schema_index": 0,
+      "start_offset_s": 0.0010164350387640297,
+      "status": 200
+    },
+    {
+      "constrained": true,
+      "error": null,
+      "finish_reason": "length",
+      "index": 1,
+      "latency_s": 0.27282170101534575,
+      "ok": true,
+      "scheduled_offset_s": 0.0,
+      "schema_file": "/home/louis/tmp/mistral.rs/plans/ff-round-two/fixtures/partial.schema.json",
+      "schema_index": 0,
+      "start_offset_s": 0.0019104779930785298,
+      "status": 200
+    }
+  ],
+  "schema_files": [
+    "/home/louis/tmp/mistral.rs/plans/ff-round-two/fixtures/partial.schema.json"
+  ],
+  "schema_set": "identical",
+  "seed": 42,
+  "server_cmd": [
+    "/home/louis/tmp/mistral.rs/target/debug/mistralrs",
+    "serve",
+    "--model-id",
+    "unsloth/Qwen3.5-4B-GGUF",
+    "--quant",
+    "4",
+    "--paged-attn",
+    "on",
+    "--max-batch-size",
+    "2",
+    "--max-seqs",
+    "2",
+    "--no-ui",
+    "--port",
+    "1235",
+    "-v"
+  ],
+  "server_cmd_raw": "/home/louis/tmp/mistral.rs/target/debug/mistralrs serve --model-id unsloth/Qwen3.5-4B-GGUF --quant 4 --paged-attn on --max-batch-size 2 --max-seqs 2 --no-ui --port 1235 -v",
+  "stagger_seconds": 0.0,
+  "startup_timeout_seconds": 120.0,
+  "timestamp_utc": "20260910T150731Z",
+  "unconstrained_fraction": 0.25,
+  "wall_elapsed_s": 0.2748864479945041
+}

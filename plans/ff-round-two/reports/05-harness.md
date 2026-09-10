@@ -1,15 +1,19 @@
 # 05 -- The experimental harness
 
 Status: implemented, locally validated at the Python level (syntax, argument parsing, helper logic,
-and a stdlib-`http.server` stub for the HTTP paths). Not run end-to-end against a live model -- no
-Rust toolchain, no built `mistralrs-cli`/server binary, and no downloaded model in any session so
-far, consistent with every prior report in this plan set.
+and a stdlib-`http.server` stub for the HTTP paths). Not run end-to-end against a live model in the
+sessions that wrote and audited it -- no Rust toolchain, no built `mistralrs-cli`/server binary, and
+no downloaded model in any of them.
 
 A later audit of this harness found five problems and they have since been fixed on this branch;
 "Audit follow-up" at the end of this document lists them, and the sections below describe the
 harness as it stands after those fixes. Nothing in that follow-up changes what is and is not
 experimentally verified: still no live inference, no CUDA run, no AnyMoE routing evidence and no
 recurrent-site arm counts.
+
+**Superseded in part on 2026-09-10:** a CUDA build of the server was produced and `concurrency` mode
+was exercised against it. See "Live smoke test on CUDA (2026-09-10)" below for exactly what that run
+does and does not establish -- in particular it is *not* evidence about whether fast-forward works.
 
 ## Where the harness lives, and why
 
@@ -276,8 +280,10 @@ staggered schedule, `/metrics` before/after deltas across the whole `mistralrs_`
 composition histogram) or dimension 4 (per-batch minimum splice width) -- those need the
 `mistralrs-core` instrumentation plan 06 reserves for itself, not something plan 05 should have
 added. Plan 06 also needs a paged-attention-capable (CUDA/Metal) build to run `concurrency` mode at
-all (`paged_attn_supported()` is a compile-time `false` on CPU), which no session so far can produce
-or verify. `equality` and its two extensions are otherwise usable by plans 03 and 04 once a
+all (`paged_attn_supported()` is a compile-time `false` on CPU); as of 2026-09-10 such a build exists
+and `concurrency` mode has been run against it (see the live smoke test below), which also surfaced
+a new precondition for plan 06 -- no `mistralrs_grammar_ff_*` series has yet been observed, so
+dimensions 1, 2 and 4 have no denominator until a run stages a splice. `equality` and its two extensions are otherwise usable by plans 03 and 04 once a
 toolchain, a model, and (for `routing-log`/`arms`) the missing `mistralrs-core` log lines exist.
 
 ## Audit follow-up
@@ -326,7 +332,120 @@ One more thing worth recording for whoever writes plan 03's instrumentation: `Mo
 threaded into `MoeMlp` before a log line can carry one. The harness will key on whatever field the
 line does carry; it cannot invent the layer.
 
+## Live smoke test on CUDA (2026-09-10)
+
+A CUDA-enabled `mistralrs` CLI binary was built from `grammar-fast-forward` (tip `4ba40ca9e`) and
+launched, and `concurrency` mode was run against it. This section records the result. **It is a
+smoke test of the harness and the build, not a measurement of fast-forward**, and none of it should
+be read as evidence that fast-forward does or does not work.
+
+### Configuration
+
+Model `unsloth/Qwen3.5-4B-GGUF`, `--quant 4`, `--paged-attn on`, `--no-ui`, `-v`. Two runs on port
+1234 with `--max-batch-size 8 --max-seqs 8`, and a later clean-process run on port 1235 with
+`--max-batch-size 2 --max-seqs 2`. `MISTRALRS_GRAMMAR_FAST_FORWARD=1` in every case; the value was
+checked in the running process's own environment, not only in the launching shell, and the harness
+recorded it as `flag_env_value: "1"`.
+
+### What the runs established
+
+1. A CUDA server built from the FF source branch starts and serves.
+2. The FF environment flag was actually present in the server process.
+3. Grammar-constrained inference succeeds with the flag on. A single `POST /v1/chat/completions`
+   carrying the plan 05 partial JSON schema returned HTTP 200 with valid JSON in
+   `reasoning_content`, 32 completion tokens, finish reason `stop`. The `concurrency` runs returned
+   HTTP 200 on every request (`count_failed: 0`) at `max_tokens` 16 and 32, finish reason `length`.
+4. `GET /metrics` works: the two full-namespace scrapes captured 88 and 92 samples before the burst
+   and produced non-empty deltas (CUDA graph dispatch counts, device memory, token counters).
+5. **No `mistralrs_grammar_ff_*` series was observed** in any scrape, on either port, at either
+   batch size, with the full `mistralrs_` prefix or with the prefix narrowed to
+   `mistralrs_grammar_ff_`.
+6. A search of the server log after the constrained request for `forced:`, `fixed_tokens:`,
+   `not-forcing`, `no fixed tokens`, `fast-forward splice` and `injecting prefix` matched nothing.
+
+Raw artifacts, committed beside this report:
+
+| File | What it is |
+|---|---|
+| `05-concurrency-on-live-smoke-20260910T145758Z.json` | first `concurrency` run, identical schemas, N=2, full `mistralrs_` prefix |
+| `06-concurrency-on-live-differing-2-20260910T145832Z.json` | differing schemas, N=2, full `mistralrs_` prefix (labelled `06` by `--plan`; it is a smoke run, not plan 06's measurement) |
+| `05-concurrency-on-live-ff-metrics-20260910T150731Z.json` | clean process on port 1235, prefix narrowed to `mistralrs_grammar_ff_`; `metrics_before`, `metrics_after` and `metrics_delta` are all empty objects |
+
+The single curl request in point 3 was issued by hand and is not one of the three JSON reports; the
+reports' requests hit `max_tokens` and finished with `length`.
+
+### What the absence of the counters does and does not mean
+
+The two staging counters are `metrics`-crate counters at `pipeline/sampling.rs:1637`
+(`mistralrs_grammar_ff_splices_staged_total`) and `engine/mod.rs:1851`
+(`mistralrs_grammar_ff_tokens_fed_total`), both re-confirmed at tip `4ba40ca9e` in this session. A
+Prometheus recorder renders a counter only once it has been incremented, and
+`mistralrs-server-core/src/metrics.rs` installs one global `PrometheusBuilder` recorder with no
+allowlist, so there is no filtering story that would hide an incremented counter. The honest reading
+is therefore exactly this and no more:
+
+> **These requests did not produce a non-empty fast-forward splice at the instrumented call site.**
+
+That is a statement about these requests. It is **not** evidence that fast-forward is broken, and
+nothing here shows fast-forward activating either. At least four causes are consistent with the
+observation and the runs do not separate them:
+
+- `supports_grammar_fast_forward` was false at pipeline load. On the GGUF path it is
+  `grammar_fast_forward_enabled() && !no_kv_cache && !is_xlora` (`pipeline/gguf.rs:1415`); the env
+  flag was set, but the other two conjuncts were not independently observed, and nothing logs the
+  resolved value.
+- `llg.consume_ff_tokens()` returned empty. The session that ran the test read the installed
+  `llguidance-1.4.0` and reports that `ff_tokens()` yields tokens only when new forced bytes exist
+  *and* `token_env.tokenize_is_canonical()` holds, and that `can_force_bytes()` additionally requires
+  `!lexer_spec().no_forcing`. That trace was not re-verified here -- no `llguidance` source and no
+  cargo registry in this container -- and is recorded as reported, not as established. The token env
+  in question is the `toktrie_hf_tokenizers::ByteTokenizerEnv` built in `pipeline/llg.rs:50-56`.
+- The schema's forced spans genuinely produced no splice under these short generations.
+- Some path between staging and the counter (not exercised here) suppressed it.
+
+Note also that a `metrics`-crate counter that is never incremented is indistinguishable from a
+call site that was never compiled in or never reached. **There is currently no positive signal for
+"fast-forward is live in this process"** -- no gauge, no startup log of the resolved
+`supports_grammar_fast_forward`, no counter for "splice computed, empty". Every FF counter on this
+branch fires only on the success path, so a zero reads identically to a misconfiguration. That gap
+is the reason the next section exists.
+
+### Consequence for plan 06
+
+Plan 06's dimensions 1 and 2 are ratios whose denominator is
+`mistralrs_grammar_ff_splices_staged_total` / `mistralrs_grammar_ff_tokens_fed_total`. On the
+evidence above, that denominator is currently observed as absent on the one model/build combination
+anyone has run. Measuring drop rates against an absent denominator produces 0/0, not a result.
+
+Plan 06 therefore needs an **FF-activation precondition** discharged before any of its sweeps are
+run and reported: a run in which `mistralrs_grammar_ff_splices_staged_total` is observed non-zero,
+establishing that the instrumented path is reachable in that build with that model and that grammar.
+Until that precondition holds, plan 06's workload sweep can still be executed -- the harness works,
+the server works, and dimension 5 (tokens/s and forward passes, flag on vs flag off) is measurable
+without any FF counter at all -- but dimensions 1, 2 and 4 must be reported as *not yet measurable*
+rather than as zero. This is a prerequisite added to plan 06, not a finding against the FF
+implementation.
+
+Two cheap discriminators for that precondition, in the order a next session should try them:
+
+1. Re-run `equality`/`concurrency` against a non-GGUF HF checkpoint via `Which.Plain`, where a real
+   `tokenizer.json` is loaded. This separates "the GGUF-derived token env is not canonical for
+   llguidance" from "fast-forward stages nothing here regardless of model". (The plan 05 Python
+   `equality` harness could not be used against the GGUF repo at all: the `Runner` path needs a
+   top-level `tokenizer.json` that `unsloth/Qwen3.5-4B-GGUF` does not expose. That is a
+   harness/model-format limitation and carries no FF information.)
+2. Longer generations with more forced structure (a schema with long literal key names and more
+   required fields), so that a splice has more opportunity to be non-empty.
+
+If neither produces a non-zero staging counter, the next step is instrumentation, not inference: a
+log line or counter recording the resolved `supports_grammar_fast_forward` at load and a counter for
+"`consume_ff_tokens` returned empty". That is a plan 02/08-shaped change, and it is not authorised by
+plan 06.
+
 ## Environment note
+
+*Applies to the sessions that wrote and audited the harness; see the live smoke test above for the
+2026-09-10 CUDA run.*
 
 No Rust toolchain (`cargo`/`rustc`) and no built `mistralrs` Python extension or server binary were
 present in this container. All of the above was written and validated by reading source
