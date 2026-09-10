@@ -47,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 FF_ENV_VAR = "MISTRALRS_GRAMMAR_FAST_FORWARD"
 REPO_ROOT = Path(__file__).resolve().parent
@@ -62,8 +62,16 @@ ALL_MODES = EQUALITY_MODES + ("concurrency",)
 DEFAULT_ROUTING_LOG_PATTERN = r"EXPERT_IDX"
 DEFAULT_ARMS_PATTERN = r"\bARM\b"
 
-METRIC_PREFIX = "mistralrs_grammar_ff_"
-METRIC_LINE_RE = re.compile(r"^(" + re.escape(METRIC_PREFIX) + r"\S*)\s+(\S+)\s*$")
+# Plan 06 reads dimensions 1-2 off `mistralrs_grammar_ff_*` but dimension 5 (tokens/s, forward
+# passes) off `mistralrs_decode_tokens_processed_total` / `mistralrs_prefill_tokens_processed_total`
+# and dimension 6 (preemption, KV pressure) off `mistralrs_paged_preemptions_total` /
+# `mistralrs_kv_cache_blocks_*`, so the default has to be the whole `mistralrs_` namespace.
+DEFAULT_METRIC_PREFIXES = ("mistralrs_",)
+FF_METRIC_PREFIX = "mistralrs_grammar_ff_"
+
+# `name{label="v",other="w"} 1.5` -- Prometheus writes no space inside the label set, so the whole
+# name-plus-labels is one \S+ run and stays intact as the report key.
+METRIC_LINE_RE = re.compile(r"^([A-Za-z_:][^\s{]*(?:\{[^\s]*\})?)\s+(\S+)\s*$")
 
 
 def parse_server_cmd(raw: str) -> list[str]:
@@ -425,18 +433,35 @@ def wait_for_health(base_url: str, timeout_s: float) -> None:
     raise TimeoutError(f"server did not become healthy within {timeout_s}s: {last_err}")
 
 
-def scrape_metrics(base_url: str) -> dict[str, float]:
-    with urllib.request.urlopen(f"{base_url}/metrics", timeout=10) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
+def parse_metrics_body(body: str, prefixes: Sequence[str]) -> dict[str, float]:
+    """Parse a Prometheus text exposition body, keeping samples whose name matches any prefix.
+
+    An empty `prefixes` keeps every sample. Label sets stay in the key, so
+    `..._splice_drops_total{reason="batch_shape"}` is distinct from the same counter's other
+    reasons, which is what plan 06 dimension 1 asks for.
+    """
     out: dict[str, float] = {}
     for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
         m = METRIC_LINE_RE.match(line)
-        if m:
-            try:
-                out[m.group(1)] = float(m.group(2))
-            except ValueError:
-                continue
+        if not m:
+            continue
+        key = m.group(1)
+        if prefixes and not key.startswith(tuple(prefixes)):
+            continue
+        try:
+            out[key] = float(m.group(2))
+        except ValueError:
+            continue
     return out
+
+
+def scrape_metrics(base_url: str, prefixes: Sequence[str]) -> dict[str, float]:
+    with urllib.request.urlopen(f"{base_url}/metrics", timeout=10) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    return parse_metrics_body(body, prefixes)
 
 
 def metric_deltas(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
@@ -496,6 +521,7 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
     env.update(flag_env(args.flag))
 
     base_url = f"http://{args.server_host}:{args.server_port}"
+    metric_prefixes = list(args.metric_prefix)
 
     server_cmd = parse_server_cmd(args.server_cmd)
     print(f"--- launching server: {shlex.join(server_cmd)} ---", file=sys.stderr)
@@ -519,7 +545,7 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
                     schema = schemas[i % len(schemas)]
             bodies.append((constrained, build_concurrency_request_body(args.prompt, args.max_tokens, schema)))
 
-        metrics_before = scrape_metrics(base_url)
+        metrics_before = scrape_metrics(base_url, metric_prefixes)
         wall_start = time.perf_counter()
         results: list[ConcurrencyRequestResult] = []
         with ThreadPoolExecutor(max_workers=n) as pool:
@@ -530,7 +556,7 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
             for fut in as_completed(futures):
                 results.append(fut.result())
         wall_elapsed = time.perf_counter() - wall_start
-        metrics_after = scrape_metrics(base_url)
+        metrics_after = scrape_metrics(base_url, metric_prefixes)
     finally:
         proc.terminate()
         try:
@@ -578,6 +604,7 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
             "min": min(latencies) if latencies else None,
             "max": max(latencies) if latencies else None,
         },
+        "metric_prefixes": metric_prefixes,
         "metrics_before": metrics_before,
         "metrics_after": metrics_after,
         "metrics_delta": metric_deltas(metrics_before, metrics_after),
@@ -644,6 +671,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--schema-set", choices=("identical", "differing"), default="identical")
     p_run.add_argument("--schema-files", nargs="+", default=None)
     p_run.add_argument("--unconstrained-fraction", type=float, default=0.25)
+    p_run.add_argument("--metric-prefix", nargs="*", default=list(DEFAULT_METRIC_PREFIXES),
+                        metavar="PREFIX",
+                        help="concurrency mode only: keep only /metrics samples whose name starts "
+                             "with one of these prefixes (default: %(default)s). Pass "
+                             f"'{FF_METRIC_PREFIX}' to narrow to the fast-forward counters, or no "
+                             "value at all to keep every sample.")
     p_run.set_defaults(func=cmd_run)
 
     p_cmp = sub.add_parser("compare", help="run flag=off then flag=on as two OS processes and diff")
