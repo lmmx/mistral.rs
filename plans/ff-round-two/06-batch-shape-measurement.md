@@ -34,6 +34,31 @@ Splices staged on a step whose sampled token ends the sequence are counted in th
 never appear in the numerator, so the drop ratio reads low until New E is fixed. Measuring first and
 fixing after produces a number nobody can use.
 
+## FF-activation precondition (added 2026-09-10)
+
+`reports/05-harness.md` established that the one live CUDA run anyone has done exported no
+`mistralrs_grammar_ff_*` series at all, so dimensions 1, 2 and 4 have no denominator.
+`reports/06-ff-observability-audit.md` traced why the existing counters could not say which of five
+states the staging path was in, and added the instrumentation that can. Before this plan's sweep is
+run **and reported**, three gates must be checked against a live run, in order:
+
+- **A — capability.** `mistralrs_grammar_ff_support_total{supported="true",reason="enabled"} >= 1`
+  in the serving process. A failure here is a configuration or build problem — `reason` names the
+  conjunct — and nothing below it means anything.
+- **B — reachability and classification.** `mistralrs_grammar_ff_attempts_total` present with a
+  non-zero total, and its per-outcome distribution (`unsupported`, `grammar_stopped`,
+  `empty_splice`, `matcher_error`, `staged`) recorded in the report whatever it says. A failure here
+  is a request-shape or harness problem, not a fast-forward one. **This gate is the point of the
+  precondition:** it turns "we saw nothing" into a named state.
+- **C — measurability.** `mistralrs_grammar_ff_splices_staged_total > 0`. Until it holds, dimensions
+  1, 2 and 4 are reported as *not yet measurable*, with B's distribution attached as the reason —
+  not as zero.
+
+Dimension 5 (tokens/s and forward passes, flag on vs off) needs none of these and may be measured
+and reported regardless. `reports/06-ff-observability-audit.md` §5 gives the reading order for the
+scrape. A zero `staged` is not evidence that fast-forward is broken: an empty splice is a legitimate
+llguidance answer when the grammar forces nothing at that position.
+
 ## Dimensions to measure
 
 No threshold is pre-committed, and none should be invented. Measure these six and report them:
