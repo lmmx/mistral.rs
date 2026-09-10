@@ -17,7 +17,7 @@ use crate::{
     tools::ToolCallState,
 };
 
-use super::Pipeline;
+use super::{ff_metrics, Pipeline};
 
 macro_rules! fixup_sentencepiece {
     ($txt:expr) => {
@@ -1618,6 +1618,9 @@ pub async fn sample_sequence(
         None => first_lobprobs_response,
     };
 
+    // Classified for `mistralrs_grammar_ff_attempts_total` below. `None` for an unconstrained
+    // sequence, which is not part of that counter's population.
+    let mut ff_attempt: Option<ff_metrics::FfAttempt> = None;
     match seq.recognizer {
         SequenceRecognizer::Llguidance(ref mut llg) => {
             let ends_turn = eos_tok
@@ -1628,24 +1631,46 @@ pub async fn sample_sequence(
                     .map_err(candle_core::Error::msg)?;
                 // Stage any forced continuation (e.g. the rest of a tool call) for the next
                 // decode window to replay without a forward pass.
-                if supports_fast_forward && !llg.is_stopped() {
+                let grammar_active = !llg.is_stopped();
+                if supports_fast_forward && grammar_active {
                     let splice = llg.consume_ff_tokens();
                     // consume_ff_tokens discards its internal consume_tokens error, so check
                     // is_error before committing tokens the matcher may not have accepted.
-                    if !splice.is_empty() && !llg.is_error() {
+                    let matcher_error = llg.is_error();
+                    let outcome =
+                        ff_metrics::classify_attempt(true, true, matcher_error, splice.len());
+                    ff_attempt = Some(outcome);
+                    if matches!(outcome, ff_metrics::FfAttempt::Staged) {
                         tracing::debug!(splice_len = splice.len(), "fast-forward splice computed");
                         metrics::counter!("mistralrs_grammar_ff_splices_staged_total").increment(1);
                         seq.set_pending_ff_tokens(splice);
-                    } else if llg.is_error() {
+                    } else if matcher_error {
                         tracing::warn!(
                             error = llg.get_error().unwrap_or_default(),
                             "llguidance matcher errored while computing a fast-forward splice"
                         );
                     }
+                } else {
+                    ff_attempt = Some(ff_metrics::classify_attempt(
+                        supports_fast_forward,
+                        grammar_active,
+                        false,
+                        0,
+                    ));
                 }
+            } else {
+                ff_attempt = Some(ff_metrics::classify_attempt(
+                    supports_fast_forward,
+                    false,
+                    false,
+                    0,
+                ));
             }
         }
         SequenceRecognizer::None => {}
+    }
+    if let Some(outcome) = ff_attempt {
+        ff_metrics::record_attempt(outcome);
     }
 
     if let SequenceRecognizer::Llguidance(ref llg) = seq.recognizer {
