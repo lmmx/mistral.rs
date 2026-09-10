@@ -42,6 +42,9 @@ fn anymoe_metadata_override(inner: &GeneralMetadata) -> GeneralMetadata {
         inner.cache_engine.is_none(),
         "AnyMoE disables PagedAttention, so the wrapped pipeline's cache_engine must be None"
     );
+    crate::pipeline::ff_metrics::record_support(
+        crate::pipeline::ff_metrics::FfSupport::PipelineUnsupported,
+    );
     GeneralMetadata {
         max_seq_len: inner.max_seq_len,
         llg_factory: inner.llg_factory.clone(),

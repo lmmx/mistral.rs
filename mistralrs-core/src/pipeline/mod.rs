@@ -9,6 +9,7 @@ pub use cuda_graph::CudaDecodeGraphLaunch;
 mod diffusion;
 mod embedding;
 pub(crate) mod execution;
+pub(crate) mod ff_metrics;
 mod ggml;
 mod gguf;
 pub(crate) mod hf;

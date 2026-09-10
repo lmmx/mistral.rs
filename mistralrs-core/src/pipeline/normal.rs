@@ -286,9 +286,10 @@ pub(crate) fn build_normal_pipeline(
                 output: vec![SupportedModality::Text],
             },
             loaded_for_uqff_write,
-            supports_grammar_fast_forward: crate::perf_flags::grammar_fast_forward_enabled()
-                && !no_kv_cache
-                && !is_xlora,
+            supports_grammar_fast_forward: crate::pipeline::ff_metrics::resolve_support(
+                no_kv_cache,
+                is_xlora,
+            ),
         }),
         #[cfg(feature = "cuda")]
         cuda_decode_graph: StdMutex::new(CudaDecodeGraphState::default()),

@@ -397,9 +397,10 @@ impl Loader for GGMLLoader {
                     output: vec![SupportedModality::Text],
                 },
                 loaded_for_uqff_write: false,
-                supports_grammar_fast_forward: crate::perf_flags::grammar_fast_forward_enabled()
-                    && !self.no_kv_cache
-                    && !is_xlora,
+                supports_grammar_fast_forward: crate::pipeline::ff_metrics::resolve_support(
+                    self.no_kv_cache,
+                    is_xlora,
+                ),
             }),
             generation_defaults,
         })))
