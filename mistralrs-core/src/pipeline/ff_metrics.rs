@@ -1,21 +1,11 @@
 //! Observability for the grammar fast-forward staging path.
 //!
-//! Two bounded counters, and one log line per pipeline load:
+//! - `mistralrs_grammar_ff_support_total{supported,reason}`: recorded once per pipeline load.
+//! - `mistralrs_grammar_ff_attempts_total{outcome}`: recorded once per grammar-constrained decode
+//!   step, at the `Matcher::consume_ff_tokens` call site in `sampling.rs`. Not recorded for
+//!   unconstrained sequences.
 //!
-//! - `mistralrs_grammar_ff_support_total{supported,reason}` — recorded once per pipeline load,
-//!   saying whether that pipeline resolved fast-forward support and, if not, which conjunct
-//!   denied it. Distinguishes configuration from runtime eligibility.
-//! - `mistralrs_grammar_ff_attempts_total{outcome}` — recorded once per grammar-constrained
-//!   decode step, classifying what happened at the `Matcher::consume_ff_tokens` call site in
-//!   `sampling.rs`. Not recorded for unconstrained sequences, so its total is the number of
-//!   constrained decode steps.
-//!
-//! The load-time record also pre-registers every `outcome` series at zero, so a process where
-//! the staging path is never reached renders explicit zeros instead of nothing at all: an
-//! absent series and a never-incremented one are otherwise indistinguishable in Prometheus.
-//!
-//! Neither counter carries prompt, schema or token content; every label is drawn from a fixed
-//! set of five (outcomes) and five (support reasons) `&'static str`s.
+//! The support record pre-registers every attempt outcome series at zero in Prometheus.
 
 const SUPPORT_METRIC: &str = "mistralrs_grammar_ff_support_total";
 const ATTEMPT_METRIC: &str = "mistralrs_grammar_ff_attempts_total";
@@ -82,9 +72,7 @@ impl FfAttempt {
     }
 }
 
-/// The conjunction the text pipelines each spelled out inline before this function existed:
-/// the env flag, a KV cache, and not X-LoRA. Returns the same boolean they stored in
-/// `GeneralMetadata::supports_grammar_fast_forward`, and records why.
+/// Resolves `GeneralMetadata::supports_grammar_fast_forward` and records why.
 pub(crate) fn resolve_support(no_kv_cache: bool, is_xlora: bool) -> bool {
     let resolved = if !crate::perf_flags::grammar_fast_forward_enabled() {
         FfSupport::FlagDisabled
@@ -99,8 +87,8 @@ pub(crate) fn resolve_support(no_kv_cache: bool, is_xlora: bool) -> bool {
     resolved.supported()
 }
 
-/// Records a pipeline's resolved fast-forward capability, and pre-registers the per-step
-/// outcome series so they render as zeros rather than being absent.
+/// Records a pipeline's resolved fast-forward capability and pre-registers every attempt
+/// outcome series at zero.
 pub(crate) fn record_support(resolved: FfSupport) {
     tracing::info!(
         supported = resolved.supported(),
@@ -118,11 +106,10 @@ pub(crate) fn record_support(resolved: FfSupport) {
     }
 }
 
-/// Classifies one grammar-constrained decode step. Pure, so the taxonomy is testable without a
-/// model, a tokenizer or a GPU.
+/// Classifies one grammar-constrained decode step.
 ///
-/// `grammar_active` is "the matcher is still running after consuming the sampled token, and that
-/// token did not end the turn". `matcher_error` and `splice_len` describe the result of
+/// `grammar_active` means the matcher is still running after consuming the sampled token and
+/// that token did not end the turn. `matcher_error` and `splice_len` describe the result of
 /// `consume_ff_tokens`, and are only meaningful when the first two arguments are both true.
 pub(crate) fn classify_attempt(
     supports_fast_forward: bool,
@@ -131,8 +118,6 @@ pub(crate) fn classify_attempt(
     splice_len: usize,
 ) -> FfAttempt {
     if !supports_fast_forward {
-        // Checked first on purpose: with the capability off, every constrained step should say so
-        // rather than reporting whatever the grammar happened to be doing.
         FfAttempt::Unsupported
     } else if !grammar_active {
         FfAttempt::GrammarStopped
@@ -178,8 +163,6 @@ mod tests {
 
     #[test]
     fn matcher_error_wins_over_splice_length() {
-        // Matches the call site: `!splice.is_empty() && !llg.is_error()` stages, so an errored
-        // matcher is never staged however long the splice it returned.
         assert_eq!(
             classify_attempt(true, true, true, 0),
             FfAttempt::MatcherError

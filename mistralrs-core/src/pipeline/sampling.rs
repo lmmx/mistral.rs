@@ -1618,8 +1618,7 @@ pub async fn sample_sequence(
         None => first_lobprobs_response,
     };
 
-    // Classified for `mistralrs_grammar_ff_attempts_total` below. `None` for an unconstrained
-    // sequence, which is not part of that counter's population.
+    // None for an unconstrained sequence; not recorded in mistralrs_grammar_ff_attempts_total.
     let mut ff_attempt: Option<ff_metrics::FfAttempt> = None;
     match seq.recognizer {
         SequenceRecognizer::Llguidance(ref mut llg) => {
