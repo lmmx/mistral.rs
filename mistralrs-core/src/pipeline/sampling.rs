@@ -481,6 +481,9 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 seq.set_state(crate::sequence::SequenceState::Done(
                     crate::sequence::StopReason::Canceled,
                 ));
+                // Discard after the state transition: a failed llguidance rollback inside this
+                // call overwrites the state with `Error`, which must win over `Done`.
+                seq.discard_pending_ff_tokens("sequence_end");
                 this.reset_non_granular_state();
             }
         }
@@ -492,6 +495,8 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 cache_finished_sequence(this, prefix_cacher, seq)?;
             }
             seq.set_state(crate::sequence::SequenceState::Done(reason));
+            // Discard after the state transition; see the comment on the Canceled path above.
+            seq.discard_pending_ff_tokens("sequence_end");
             this.reset_non_granular_state();
         }
     } else if let Some(mut reason) = is_done {
@@ -502,6 +507,8 @@ pub(crate) async fn finish_or_add_toks_to_seq(
         */
         {
             seq.set_state(crate::sequence::SequenceState::Done(reason));
+            // Discard after the state transition; see the comment on the Canceled path above.
+            seq.discard_pending_ff_tokens("sequence_end");
             let (tokenizer, pipeline_name) = {
                 let pipeline_name = this.name();
                 let tokenizer = this.tokenizer();

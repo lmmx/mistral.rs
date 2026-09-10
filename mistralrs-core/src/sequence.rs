@@ -1257,7 +1257,8 @@ impl Sequence {
 
     /// Discards a staged fast-forward splice that won't reach the decode window this step,
     /// rolling the llguidance matcher back by the splice length. `reason` labels
-    /// `mistralrs_grammar_ff_splice_drops_total` for the caller's discard site.
+    /// `mistralrs_grammar_ff_splice_drops_total` and `mistralrs_grammar_ff_tokens_dropped_total`
+    /// for the caller's discard site.
     pub(crate) fn discard_pending_ff_tokens(&mut self, reason: &'static str) {
         let splice = self.take_pending_ff_tokens();
         if splice.is_empty() {
@@ -1275,6 +1276,8 @@ impl Sequence {
         }
         metrics::counter!("mistralrs_grammar_ff_splice_drops_total", "reason" => reason)
             .increment(1);
+        metrics::counter!("mistralrs_grammar_ff_tokens_dropped_total", "reason" => reason)
+            .increment(splice.len() as u64);
     }
 
     pub fn get_initial_prompt(&self) -> &str {
@@ -3759,5 +3762,44 @@ mod tests {
         assert_eq!(seq.take_audios().unwrap().len(), 1);
         assert_eq!(seq.video_hashes().unwrap().len(), 1);
         assert_eq!(seq.take_videos().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn discard_pending_ff_tokens_clears_a_staged_splice() {
+        let mut seq = make_test_sequence();
+        seq.set_pending_ff_tokens(vec![10, 11, 12]);
+
+        seq.discard_pending_ff_tokens("sequence_end");
+
+        assert!(seq.active_pending_ff_tokens().is_empty());
+    }
+
+    #[test]
+    fn discard_pending_ff_tokens_is_a_noop_without_a_staged_splice() {
+        let mut seq = make_test_sequence();
+
+        // Must not panic or otherwise misbehave when there is nothing to discard: every
+        // terminal-state call site calls this unconditionally, staged splice or not.
+        seq.discard_pending_ff_tokens("sequence_end");
+
+        assert!(seq.active_pending_ff_tokens().is_empty());
+    }
+
+    #[test]
+    fn terminal_state_set_before_discard_is_not_clobbered() {
+        // New E (docs/journal/2026-09-09-fast-forward-second-round-research.md): every stranding
+        // fix sets the terminal state and then discards, not the other way around, so that a
+        // failed llguidance rollback's `SequenceState::Error` (set from inside
+        // `discard_pending_ff_tokens`) is not overwritten back to `Done` by a caller that ran the
+        // steps in the other order. `SequenceRecognizer::None` never fails a rollback, so this
+        // asserts the ordering leaves `Done` intact on the ordinary path.
+        let mut seq = make_test_sequence();
+        seq.set_pending_ff_tokens(vec![10, 11]);
+
+        seq.set_state(SequenceState::Done(StopReason::Canceled));
+        seq.discard_pending_ff_tokens("sequence_end");
+
+        assert_eq!(seq.getstate(), SequenceState::Done(StopReason::Canceled));
+        assert!(seq.active_pending_ff_tokens().is_empty());
     }
 }

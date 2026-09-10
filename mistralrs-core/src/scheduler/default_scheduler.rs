@@ -235,9 +235,10 @@ impl<Backer: FcfsBacker> DefaultScheduler<Backer> {
             (0, _) => {
                 self.running = self.bucket_and_waitlist_seqs(running);
                 if TERMINATE_ALL_NEXT_STEP.load(Ordering::SeqCst) {
-                    self.running
-                        .iter_mut()
-                        .for_each(|seq| seq.set_state(SequenceState::Done(StopReason::Canceled)));
+                    self.running.iter_mut().for_each(|seq| {
+                        seq.set_state(SequenceState::Done(StopReason::Canceled));
+                        seq.discard_pending_ff_tokens("sequence_end");
+                    });
                     TERMINATE_ALL_NEXT_STEP.store(false, Ordering::SeqCst);
                 }
                 logger.set_num_running(self.running.len());
@@ -331,10 +332,13 @@ impl Scheduler for DefaultScheduler<VecDeque<Sequence>> {
     }
     fn cancel_closed_response_groups(&mut self) {
         self.running
-            .iter()
-            .chain(self.waiting.iter())
+            .iter_mut()
+            .chain(self.waiting.iter_mut())
             .filter(|seq| seq.response_is_closed() && !seq.is_finished_paged_attn())
-            .for_each(|seq| seq.set_state(SequenceState::Done(StopReason::Canceled)));
+            .for_each(|seq| {
+                seq.set_state(SequenceState::Done(StopReason::Canceled));
+                seq.discard_pending_ff_tokens("sequence_end");
+            });
     }
     fn block_size(&self) -> Option<usize> {
         None
@@ -537,5 +541,26 @@ mod tests {
         scheduler.free_finished_sequence_groups();
         assert!(scheduler.running.is_empty());
         assert!(scheduler.waiting.is_empty());
+    }
+
+    #[test]
+    fn closed_response_cancellation_discards_a_staged_ff_splice() {
+        // New E (docs/journal/2026-09-09-fast-forward-second-round-research.md,
+        // plans/ff-round-two/02-splice-accounting.md): DefaultScheduler runs (e.g. the CPU GGUF
+        // demo) support grammar fast-forward too, so this cancellation path needs the same
+        // `discard_pending_ff_tokens` fix as the paged scheduler's.
+        let mut scheduler =
+            DefaultScheduler::new(DefaultSchedulerMethod::Fixed(NonZeroUsize::new(2).unwrap()));
+        let mut running = test_sequence(10, None);
+        running.set_pending_ff_tokens(vec![10, 11, 12]);
+        scheduler.add_seq(running);
+
+        Scheduler::cancel_closed_response_groups(&mut scheduler);
+
+        assert_eq!(
+            scheduler.running[0].getstate(),
+            SequenceState::Done(StopReason::Canceled)
+        );
+        assert!(scheduler.running[0].active_pending_ff_tokens().is_empty());
     }
 }

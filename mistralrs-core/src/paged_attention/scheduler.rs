@@ -1239,7 +1239,11 @@ impl PagedAttentionScheduler {
                 .iter()
                 .chain(prompt_running.iter())
                 .for_each(|seq| {
-                    get_mut_arcmutex!(seq).set_state(SequenceState::Done(StopReason::Canceled))
+                    let mut seq = get_mut_arcmutex!(seq);
+                    seq.set_state(SequenceState::Done(StopReason::Canceled));
+                    // Discard after the state transition: a failed llguidance rollback inside
+                    // this call overwrites the state with `Error`, which must win over `Done`.
+                    seq.discard_pending_ff_tokens("sequence_end");
                 });
             TERMINATE_ALL_NEXT_STEP.store(false, Ordering::SeqCst);
             self.running.extend(prompt_running);
@@ -1444,9 +1448,10 @@ impl Scheduler for PagedAttentionScheduler {
             .iter()
             .chain(self.waiting.iter())
             .for_each(|seq| {
-                let seq = get_mut_arcmutex!(seq);
+                let mut seq = get_mut_arcmutex!(seq);
                 if seq.response_is_closed() && !seq.is_finished_paged_attn() {
                     seq.set_state(SequenceState::Done(StopReason::Canceled));
+                    seq.discard_pending_ff_tokens("sequence_end");
                 }
             });
     }
@@ -2236,6 +2241,27 @@ mod tests {
         Scheduler::cancel_closed_response_groups(&mut scheduler);
 
         assert!(!scheduler.can_continue_decode_batch(&[10]));
+    }
+
+    #[test]
+    fn closed_response_cancellation_discards_a_staged_ff_splice() {
+        // New E (docs/journal/2026-09-09-fast-forward-second-round-research.md,
+        // plans/ff-round-two/02-splice-accounting.md): a response channel closing mid-decode is a
+        // sequence-termination path that bypassed `discard_pending_ff_tokens` entirely, stranding
+        // any splice staged on a prior step.
+        let mut scheduler = test_scheduler();
+        let (seq, rx) = test_sequence_with_media_and_receiver(10, 4, None, None, None);
+        get_mut_arcmutex!(seq).set_pending_ff_tokens(vec![10, 11, 12]);
+        scheduler.running.push_back(seq.clone());
+
+        drop(rx);
+        Scheduler::cancel_closed_response_groups(&mut scheduler);
+
+        assert_eq!(
+            get_mut_arcmutex!(seq).getstate(),
+            SequenceState::Done(StopReason::Canceled)
+        );
+        assert!(get_mut_arcmutex!(seq).active_pending_ff_tokens().is_empty());
     }
 
     #[test]

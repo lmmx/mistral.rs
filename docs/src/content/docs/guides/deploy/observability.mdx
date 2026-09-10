@@ -123,7 +123,23 @@ These metrics are populated only when [grammar fast-forward](/guides/serve/struc
 |---|---|---|---|
 | `mistralrs_grammar_ff_splices_staged_total` | counter | - | Forced multi-token spans staged by the grammar matcher. |
 | `mistralrs_grammar_ff_tokens_fed_total` | counter | - | Staged tokens actually fed into a decode window. Also the number of decode forward passes skipped, which is the feature's payoff. |
-| `mistralrs_grammar_ff_splice_drops_total` | counter | `reason` | Staged spans discarded before they reached a decode window. `reason` is `batch_shape` (another sequence in the same step staged a span of a different length, or none at all), `preemption` (the sequence was preempted before its span was fed), or `realloc` (the sequence's token list was rebuilt, invalidating the staged span). |
+| `mistralrs_grammar_ff_splice_drops_total` | counter | `reason` | Staged spans discarded before they reached a decode window. See "`reason` values" below. |
+| `mistralrs_grammar_ff_tokens_dropped_total` | counter | `reason` | Tokens discarded along with a dropped span (`splice.len()` per drop, so this is the token-level counterpart of `..._splice_drops_total`). Use this, not the splice count, to size *forced tokens lost*. |
+
+**Conservation invariant:** every staged span is either fed or dropped, never both and never neither —
+`mistralrs_grammar_ff_splices_staged_total == (spans implied by mistralrs_grammar_ff_tokens_fed_total) + mistralrs_grammar_ff_splice_drops_total`,
+over the life of the process, modulo spans in flight at scrape time. `tokens_fed_total` counts tokens
+rather than spans; use `tokens_dropped_total` for the matching token-level identity:
+`(tokens implied by staged spans) == mistralrs_grammar_ff_tokens_fed_total + mistralrs_grammar_ff_tokens_dropped_total`.
+
+**`reason` values** (shared by both drop counters):
+
+| `reason` | Lifecycle event |
+|---|---|
+| `batch_shape` | Another sequence in the same decode step staged a span of a different length, or none at all, so the whole batch's spans were discarded to keep the window rectangular. |
+| `preemption` | The sequence was preempted (paged attention) and returned to the waiting queue before its span was fed. |
+| `realloc` | The sequence's token list was rebuilt (e.g. prefix-cache reallocation), invalidating the staged span. |
+| `sequence_end` | The sequence reached a terminal state — `Done` (any `StopReason`: `Eos`, `Length`, `ModelLength`, `StopTok`, `StopString`, `Canceled`, or `ToolCalls`) or `Error` — while still holding a staged span from the step that just ran. This is the fix for the defect described in `docs/journal/2026-09-09-fast-forward-second-round-research.md` ("New E"): a span staged inside sampling and never fed because the same token that produced it also ended the sequence. |
 
 ### Useful PromQL
 
@@ -155,7 +171,18 @@ mistralrs_sequences_running / mistralrs_sequences_capacity
 # Fraction of staged grammar fast-forward spans dropped before reaching a decode window
 sum(rate(mistralrs_grammar_ff_splice_drops_total[5m]))
   / sum(rate(mistralrs_grammar_ff_splices_staged_total[5m]))
+
+# Fraction of staged fast-forward tokens (not spans) lost, split by why
+sum(rate(mistralrs_grammar_ff_tokens_dropped_total[5m])) by (reason)
+  / sum(rate(mistralrs_grammar_ff_splices_staged_total[5m]))
 ```
+
+Every staged span now lands in exactly one of `..._tokens_fed_total` or `..._splice_drops_total{reason=...}`
+— including a span whose owning sequence finishes on the very step it was staged, which is counted under
+`reason="sequence_end"` rather than silently vanishing from the denominator. Before this was fixed, spans
+ending a request this way inflated `splices_staged_total` without ever appearing in the drop count, which
+read the ratio above artificially low precisely on short grammar-constrained completions (the tool-call
+shape the feature targets).
 
 If you want gauge-like ergonomics for the acceptance rate, use a recording rule instead of a server-side percentile gauge:
 
