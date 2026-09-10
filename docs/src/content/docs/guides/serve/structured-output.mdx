@@ -175,7 +175,7 @@ Off by default; set `MISTRALRS_GRAMMAR_FAST_FORWARD=1` to enable it once you've 
 
 A span is fed only when every sequence running in that step has staged one of the same length. Span length tracks each request's own position in its own grammar, so two concurrent grammar-constrained requests ordinarily agree on nothing, and the batch falls back to the flag-off baseline for that step. Watch [`mistralrs_grammar_ff_splice_drops_total{reason="batch_shape"}`](/guides/deploy/observability/#grammar-fast-forward) to see how often this happens under your traffic.
 
-Requires a KV cache (no effect under `--no-kv-cache`) and is not available under X-LoRA or for multimodal pipelines.
+Requires a KV cache (no effect under `--no-kv-cache`) and is not available under X-LoRA, for multimodal pipelines, or for AnyMoE -- AnyMoE picks one expert per decode window rather than per token, so widening the window changes routing granularity.
 
 ## Notes
 

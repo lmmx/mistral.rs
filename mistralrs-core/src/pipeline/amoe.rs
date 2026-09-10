@@ -30,9 +30,37 @@ use crate::{
 };
 
 use super::{
-    AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqPipelineMixin,
-    MetadataMixin, PreProcessingMixin,
+    AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, GeneralMetadata,
+    IsqPipelineMixin, MetadataMixin, PreProcessingMixin,
 };
+
+// Widened FF decode windows change AnyMoE's per-window expert selection, not just latency; force the flag off.
+// cache_engine is hardcoded None: AnyMoeLoader always forces paged_attn_config to None on the wrapped loader,
+// and CacheEngine isn't Clone, so it can't be passed through as-is.
+fn anymoe_metadata_override(inner: &GeneralMetadata) -> GeneralMetadata {
+    debug_assert!(
+        inner.cache_engine.is_none(),
+        "AnyMoE disables PagedAttention, so the wrapped pipeline's cache_engine must be None"
+    );
+    GeneralMetadata {
+        max_seq_len: inner.max_seq_len,
+        llg_factory: inner.llg_factory.clone(),
+        no_kv_cache: inner.no_kv_cache,
+        no_prefix_cache: inner.no_prefix_cache,
+        num_hidden_layers: inner.num_hidden_layers,
+        eos_tok: inner.eos_tok.clone(),
+        kind: inner.kind.clone(),
+        is_xlora: inner.is_xlora,
+        activation_dtype: inner.activation_dtype,
+        sliding_window: inner.sliding_window,
+        cache_config: inner.cache_config.clone(),
+        cache_engine: None,
+        model_metadata: inner.model_metadata.clone(),
+        modalities: inner.modalities.clone(),
+        loaded_for_uqff_write: inner.loaded_for_uqff_write,
+        supports_grammar_fast_forward: false,
+    }
+}
 
 pub struct AnyMoeLoader {
     pub target: Box<dyn Loader>,
@@ -47,6 +75,7 @@ pub struct AnyMoeLoader {
 pub struct AnyMoePipeline {
     target: Arc<tokio::sync::Mutex<dyn Pipeline>>,
     config: AnyMoeConfig,
+    metadata: Arc<GeneralMetadata>,
 }
 
 impl Loader for AnyMoeLoader {
@@ -159,7 +188,14 @@ impl AnyMoePipeline {
         layers: Vec<usize>,
         silent: bool,
     ) -> anyhow::Result<Self> {
-        let this = Self { target, config };
+        let metadata = Arc::new(anymoe_metadata_override(
+            &get_mut_arcmutex!(target).get_metadata(),
+        ));
+        let this = Self {
+            target,
+            config,
+            metadata,
+        };
         info!("Loaded pretraining dataset of {} samples.", inputs.len());
         match this.amoe_pre_train(
             inputs,
@@ -245,7 +281,7 @@ impl MetadataMixin for AnyMoePipeline {
         get_mut_arcmutex!(self.target).device()
     }
     fn get_metadata(&self) -> Arc<super::GeneralMetadata> {
-        get_mut_arcmutex!(self.target).get_metadata()
+        self.metadata.clone()
     }
     fn name(&self) -> String {
         get_mut_arcmutex!(self.target).name()
@@ -760,4 +796,55 @@ fn new_dummy_seq(
         eos_toks,
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_metadata(supports_grammar_fast_forward: bool) -> GeneralMetadata {
+        GeneralMetadata {
+            max_seq_len: 4096,
+            llg_factory: None,
+            no_kv_cache: false,
+            no_prefix_cache: false,
+            num_hidden_layers: 1,
+            eos_tok: vec![],
+            kind: ModelKind::default(),
+            is_xlora: false,
+            activation_dtype: DType::F32,
+            sliding_window: None,
+            cache_config: None,
+            cache_engine: None,
+            model_metadata: None,
+            modalities: super::super::Modalities {
+                input: vec![],
+                output: vec![],
+            },
+            loaded_for_uqff_write: false,
+            supports_grammar_fast_forward,
+        }
+    }
+
+    #[test]
+    fn anymoe_forces_grammar_fast_forward_off() {
+        let inner = dummy_metadata(true);
+        let overridden = anymoe_metadata_override(&inner);
+        assert!(!overridden.supports_grammar_fast_forward);
+    }
+
+    #[test]
+    fn anymoe_override_only_touches_the_ff_flag() {
+        let inner = dummy_metadata(false);
+        let overridden = anymoe_metadata_override(&inner);
+        assert_eq!(overridden.max_seq_len, inner.max_seq_len);
+        assert_eq!(overridden.no_kv_cache, inner.no_kv_cache);
+        assert_eq!(overridden.no_prefix_cache, inner.no_prefix_cache);
+        assert_eq!(overridden.num_hidden_layers, inner.num_hidden_layers);
+        assert_eq!(overridden.eos_tok, inner.eos_tok);
+        assert_eq!(overridden.is_xlora, inner.is_xlora);
+        assert_eq!(overridden.sliding_window, inner.sliding_window);
+        assert_eq!(overridden.loaded_for_uqff_write, inner.loaded_for_uqff_write);
+        assert!(!overridden.supports_grammar_fast_forward);
+    }
 }
