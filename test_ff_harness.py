@@ -9,7 +9,10 @@ Run with: python3 -m unittest test_ff_harness -v
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -129,6 +132,92 @@ class MetricFilterTest(unittest.TestCase):
         narrowed = parser.parse_args(base + ["--metric-prefix", ffh.FF_METRIC_PREFIX])
         self.assertEqual(narrowed.metric_prefix, [ffh.FF_METRIC_PREFIX])
         self.assertEqual(parser.parse_args(base + ["--metric-prefix"]).metric_prefix, [])
+
+
+def _structural_chars(schema: dict) -> int:
+    """Characters a JSON-schema grammar forces outright: braces, quoted keys, colons, commas."""
+    props = schema.get("properties", {})
+    total = 2 + max(0, len(props) - 1)
+    for name, sub in props.items():
+        total += len(name) + 3
+        if sub.get("type") == "object":
+            total += _structural_chars(sub)
+    return total
+
+
+class FixtureTest(unittest.TestCase):
+    """F6: workload B is only workload B if the fixtures really force different amounts of text."""
+
+    def test_every_differing_fixture_exists_and_is_valid_json(self):
+        for path in ffh.DIFFERING_SCHEMA_FIXTURES:
+            self.assertTrue(path.is_file(), path)
+            json.loads(path.read_text())
+
+    def test_fixtures_are_partially_forcing(self):
+        for path in ffh.DIFFERING_SCHEMA_FIXTURES:
+            schema = json.loads(path.read_text())
+            self.assertEqual(schema["type"], "object", path)
+            # forced spans: closed object, every property required
+            self.assertFalse(schema["additionalProperties"], path)
+            self.assertEqual(sorted(schema["required"]), sorted(schema["properties"]), path)
+            # free spans: the model still chooses somewhere
+            leaves = _leaf_types(schema)
+            self.assertTrue(leaves & {"string", "integer"}, path)
+
+    def test_forced_span_budgets_are_all_distinct(self):
+        budgets = {p.name: _structural_chars(json.loads(p.read_text()))
+                   for p in ffh.DIFFERING_SCHEMA_FIXTURES}
+        self.assertEqual(len(set(budgets.values())), len(budgets), budgets)
+        spread = max(budgets.values()) / min(budgets.values())
+        self.assertGreater(spread, 4.0, budgets)
+
+
+def _leaf_types(schema: dict) -> set[str]:
+    out = set()
+    for sub in schema.get("properties", {}).values():
+        if sub.get("type") == "object":
+            out |= _leaf_types(sub)
+        else:
+            out.add(sub.get("type"))
+    return out
+
+
+class SchemaSetTest(unittest.TestCase):
+    """F6: `differing` must fail loudly rather than silently becoming `identical`."""
+
+    def test_differing_defaults_to_the_full_fixture_set(self):
+        chosen = ffh.resolve_schema_files("differing", None)
+        self.assertEqual(len(chosen), len(ffh.DIFFERING_SCHEMA_FIXTURES))
+
+    def test_identical_defaults_to_the_single_equality_fixture(self):
+        self.assertEqual(ffh.resolve_schema_files("identical", None),
+                         [str(ffh.DEFAULT_SCHEMA_FIXTURE)])
+
+    def test_differing_with_one_fixture_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            ffh.resolve_schema_files("differing", [str(ffh.DEFAULT_SCHEMA_FIXTURE)])
+        self.assertIn("at least 2", str(ctx.exception))
+
+    def test_differing_with_the_same_fixture_twice_is_rejected(self):
+        dup = str(ffh.DEFAULT_SCHEMA_FIXTURE)
+        with self.assertRaises(ValueError):
+            ffh.resolve_schema_files("differing", [dup, dup])
+
+    def test_identical_with_one_fixture_is_fine(self):
+        ffh.resolve_schema_files("identical", [str(ffh.DEFAULT_SCHEMA_FIXTURE)])
+
+    def test_missing_fixture_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            ffh.resolve_schema_files("identical", ["/nonexistent/nope.schema.json"])
+        self.assertIn("not found", str(ctx.exception))
+
+    def test_cli_rejects_a_differing_run_that_cannot_differ(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ffh.main([
+                "run", "--mode", "concurrency", "--flag", "on", "--model-id", "x",
+                "--server-cmd", "srv --port 1", "--schema-set", "differing",
+                "--schema-files", str(ffh.DEFAULT_SCHEMA_FIXTURE),
+            ])
 
 
 if __name__ == "__main__":

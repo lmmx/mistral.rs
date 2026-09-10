@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "deployment_environment_identifier": {
+      "type": "string",
+      "enum": ["production", "staging", "development"]
+    },
+    "human_readable_status_description": {
+      "type": "string"
+    },
+    "consecutive_retry_attempt_counter": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 99
+    }
+  },
+  "required": [
+    "deployment_environment_identifier",
+    "human_readable_status_description",
+    "consecutive_retry_attempt_counter"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "properties": {
+    "run": {
+      "type": "object",
+      "properties": {
+        "release_channel_name": {
+          "type": "string",
+          "enum": ["stable", "beta", "nightly"]
+        },
+        "observed_error_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 99
+        }
+      },
+      "required": ["release_channel_name", "observed_error_count"],
+      "additionalProperties": false
+    },
+    "note": {
+      "type": "string"
+    }
+  },
+  "required": ["run", "note"],
+  "additionalProperties": false
+}

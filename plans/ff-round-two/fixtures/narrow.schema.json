@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "string",
+      "enum": ["y", "n"]
+    },
+    "n": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9
+    }
+  },
+  "required": ["ok", "n"],
+  "additionalProperties": false
+}

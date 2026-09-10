@@ -52,7 +52,16 @@ from typing import Any, Sequence
 FF_ENV_VAR = "MISTRALRS_GRAMMAR_FAST_FORWARD"
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_REPORT_DIR = REPO_ROOT / "plans" / "ff-round-two" / "reports"
-DEFAULT_SCHEMA_FIXTURE = REPO_ROOT / "plans" / "ff-round-two" / "fixtures" / "partial.schema.json"
+FIXTURE_DIR = REPO_ROOT / "plans" / "ff-round-two" / "fixtures"
+DEFAULT_SCHEMA_FIXTURE = FIXTURE_DIR / "partial.schema.json"
+# Plan 06 workload B wants differing splice widths, so these differ in how much literal text the
+# grammar forces: narrow (~12 structural chars) < partial (~37) < nested (~72) < wide (~112).
+DIFFERING_SCHEMA_FIXTURES = (
+    FIXTURE_DIR / "narrow.schema.json",
+    DEFAULT_SCHEMA_FIXTURE,
+    FIXTURE_DIR / "nested.schema.json",
+    FIXTURE_DIR / "wide.schema.json",
+)
 DEFAULT_PROMPT = (
     "Report the status of the last deployment. Respond with only the requested JSON object."
 )
@@ -100,6 +109,32 @@ def flag_env(value: str) -> dict[str, str] | None:
     if value == "unset":
         return {}
     raise ValueError(f"unknown flag value: {value!r}")
+
+
+def resolve_schema_files(schema_set: str, schema_files: list[str] | None) -> list[str]:
+    """Pick the concurrency schema set, refusing a `differing` run that cannot actually differ.
+
+    Silently round-robining one fixture would produce workload A while the report claimed workload
+    B, which is the shape plan 06 specifically needs to tell apart.
+    """
+    if schema_files:
+        chosen = list(schema_files)
+    elif schema_set == "differing":
+        chosen = [str(p) for p in DIFFERING_SCHEMA_FIXTURES]
+    else:
+        chosen = [str(DEFAULT_SCHEMA_FIXTURE)]
+
+    if schema_set == "differing":
+        distinct = {Path(p).resolve() for p in chosen}
+        if len(distinct) < 2:
+            raise ValueError(
+                "--schema-set differing needs at least 2 distinct --schema-files, got "
+                f"{len(distinct)}: {chosen}"
+            )
+    missing = [p for p in chosen if not Path(p).is_file()]
+    if missing:
+        raise ValueError(f"schema fixture(s) not found: {missing}")
+    return chosen
 
 
 def report_path(out_dir: Path, plan: str, mode: str, flag: str, label: str | None) -> Path:
@@ -522,6 +557,7 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
 
     base_url = f"http://{args.server_host}:{args.server_port}"
     metric_prefixes = list(args.metric_prefix)
+    schema_files = resolve_schema_files(args.schema_set, args.schema_files)
 
     server_cmd = parse_server_cmd(args.server_cmd)
     print(f"--- launching server: {shlex.join(server_cmd)} ---", file=sys.stderr)
@@ -529,7 +565,6 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
     try:
         wait_for_health(base_url, args.startup_timeout_seconds)
 
-        schema_files = args.schema_files or [str(DEFAULT_SCHEMA_FIXTURE)]
         schemas = [Path(p).read_text() for p in schema_files]
 
         n = args.num_requests
@@ -669,7 +704,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--startup-timeout-seconds", type=float, default=120.0)
     p_run.add_argument("--num-requests", type=int, default=8)
     p_run.add_argument("--schema-set", choices=("identical", "differing"), default="identical")
-    p_run.add_argument("--schema-files", nargs="+", default=None)
+    p_run.add_argument("--schema-files", nargs="+", default=None,
+                        help="concurrency mode only: fixtures to draw grammars from. Defaults to "
+                             "the single equality fixture for --schema-set identical and to the "
+                             "four differing-forced-span fixtures for --schema-set differing.")
     p_run.add_argument("--unconstrained-fraction", type=float, default=0.25)
     p_run.add_argument("--metric-prefix", nargs="*", default=list(DEFAULT_METRIC_PREFIXES),
                         metavar="PREFIX",
@@ -697,6 +735,7 @@ def main(argv: list[str] | None = None) -> None:
             parser.error("--server-cmd is required for --mode concurrency")
         try:
             parse_server_cmd(args.server_cmd)
+            resolve_schema_files(args.schema_set, args.schema_files)
         except ValueError as exc:
             parser.error(str(exc))
 
