@@ -17,13 +17,16 @@ Modes:
                 process's own stdout and stderr (tracing output), if the running tip logs any.
                 Debug-level logging is enabled for this mode and the effective logging config plus
                 the total number of captured lines go into the report, so "captured nothing at all"
-                is distinguishable from "captured plenty, matched none". At the tip this
+                is distinguishable from "captured plenty, matched none". Matched lines are kept
+                raw and also aggregated per layer and batch row, and `compare` diffs that
+                aggregate alongside the token ids. At the tip this
                 harness was built against, no such log line exists yet (see
                 plans/ff-round-two/reports/03-anymoe-divergence.md); this mode is the capture
                 mechanism a future instrumentation change can feed, not a claim that it finds
                 anything today.
   arms          `equality` plus best-effort capture of the nine recurrent-site arm messages from
-                the same streams, same caveat as routing-log (see reports/04-recurrent-site-audit.md).
+                the same streams, aggregated to a count per site per arm and likewise diffed by
+                `compare`. Same caveat as routing-log (see reports/04-recurrent-site-audit.md).
   concurrency   Launches an HTTP server subprocess, fires N concurrent chat completions (a mix of
                 grammar-constrained and unconstrained), and scrapes /metrics before and after.
                 Requires a paged-attention-capable (CUDA or Metal) server build.
@@ -34,6 +37,7 @@ See plans/ff-round-two/05-harness.md for the full mode contracts.
 from __future__ import annotations
 
 import argparse
+import collections
 import contextlib
 import json
 import os
@@ -75,6 +79,21 @@ ALL_MODES = EQUALITY_MODES + ("concurrency",)
 
 DEFAULT_ROUTING_LOG_PATTERN = r"EXPERT_IDX"
 DEFAULT_ARMS_PATTERN = r"\bARM\b"
+
+# Plan 04 D2 asks each of the nine arms to log "a stable site identifier and which arm ran"; plan 03
+# Part B asks for the topk(1) expert index "per forward, per layer, per batch row". Neither exists
+# yet (reports/03-anymoe-divergence.md, reports/04-recurrent-site-audit.md both record Deliverable 2
+# as not run), so the field names are options rather than assumptions. What is not guessed is the
+# rendering: this tree writes structured tracing fields (`tracing::debug!(splice_len = ..., "...")`
+# at sampling.rs:1636, `error = %e` at sequence.rs:1269), which fmt renders as trailing key=value.
+DEFAULT_ARM_SITE_FIELD = "site"
+DEFAULT_ARM_FIELD = "arm"
+DEFAULT_ROUTING_LAYER_FIELD = "layer"
+DEFAULT_ROUTING_ROW_FIELD = "row"
+DEFAULT_ROUTING_EXPERT_FIELD = "expert"
+
+TRACING_FIELD_RE = re.compile(r'([A-Za-z_][A-Za-z0-9_.]*)=("(?:[^"\\]|\\.)*"|[^\s"]+)')
+UNPARSED_EXAMPLE_LIMIT = 5
 
 DEBUG_ENV_VAR = "MISTRALRS_DEBUG"
 RUST_LOG_ENV_VAR = "RUST_LOG"
@@ -244,6 +263,109 @@ def scan_captured_streams(paths: dict[str, Path], pattern: re.Pattern) -> dict[s
     }
 
 
+def parse_tracing_fields(line: str) -> dict[str, str]:
+    """Pull the trailing `key=value` pairs off one `tracing_subscriber::fmt` line.
+
+    Values are either bare or Debug-quoted (`site="gdn/layer.rs:532"`, `arm=speculative`). Pairs
+    that happen to appear inside the message text are harmless: callers look up named fields.
+    """
+    fields: dict[str, str] = {}
+    for key, raw in TRACING_FIELD_RE.findall(line):
+        if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+            raw = raw[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        fields[key] = raw
+    return fields
+
+
+def routing_key(layer: str, row: str) -> str:
+    """Plan 05 wants routing keyed by layer and batch row; JSON keys have to be strings."""
+    return f"layer={layer},row={row}"
+
+
+def _unparsed(lines: list[dict[str, str]], parsed_indices: set[int]) -> list[str]:
+    return [entry["line"] for i, entry in enumerate(lines) if i not in parsed_indices][
+        :UNPARSED_EXAMPLE_LIMIT
+    ]
+
+
+def aggregate_arm_observations(
+    lines: list[dict[str, str]], site_field: str, arm_field: str
+) -> dict[str, Any]:
+    """Plan 05: "aggregated to a count per site per arm in the JSON report"."""
+    counts: dict[str, dict[str, int]] = {}
+    parsed_indices: set[int] = set()
+    for i, entry in enumerate(lines):
+        fields = parse_tracing_fields(entry["line"])
+        site, arm = fields.get(site_field), fields.get(arm_field)
+        if site is None or arm is None:
+            continue
+        parsed_indices.add(i)
+        counts.setdefault(site, {}).setdefault(arm, 0)
+        counts[site][arm] += 1
+    return {
+        "kind": "arms",
+        "site_field": site_field,
+        "arm_field": arm_field,
+        "counts": {site: dict(sorted(arms.items())) for site, arms in sorted(counts.items())},
+        "sites": sorted(counts),
+        "arms": sorted({arm for arms in counts.values() for arm in arms}),
+        "num_observations": len(parsed_indices),
+        "num_unparsed_lines": len(lines) - len(parsed_indices),
+        "unparsed_examples": _unparsed(lines, parsed_indices),
+    }
+
+
+def aggregate_routing_observations(
+    lines: list[dict[str, str]], layer_field: str, row_field: str, expert_field: str
+) -> dict[str, Any]:
+    """Plan 03 Part B: the per-forward topk(1) index, keyed by layer and batch row.
+
+    `sequences` keeps emission order per key so the driver can point at the first forward where two
+    runs picked different experts; `counts` is the same data collapsed for a quick read.
+    """
+    sequences: dict[str, list[str]] = {}
+    parsed_indices: set[int] = set()
+    for i, entry in enumerate(lines):
+        fields = parse_tracing_fields(entry["line"])
+        layer, row, expert = (
+            fields.get(layer_field), fields.get(row_field), fields.get(expert_field)
+        )
+        if layer is None or row is None or expert is None:
+            continue
+        parsed_indices.add(i)
+        sequences.setdefault(routing_key(layer, row), []).append(expert)
+
+    counts = {
+        key: dict(sorted(collections.Counter(experts).items()))
+        for key, experts in sequences.items()
+    }
+    return {
+        "kind": "routing",
+        "layer_field": layer_field,
+        "row_field": row_field,
+        "expert_field": expert_field,
+        "sequences": {key: sequences[key] for key in sorted(sequences)},
+        "counts": {key: counts[key] for key in sorted(counts)},
+        "keys": sorted(sequences),
+        "num_observations": len(parsed_indices),
+        "num_unparsed_lines": len(lines) - len(parsed_indices),
+        "unparsed_examples": _unparsed(lines, parsed_indices),
+    }
+
+
+def aggregate_capture(mode: str, capture: dict[str, Any], args: argparse.Namespace) -> None:
+    """Attach the mode's aggregate to `capture`, leaving `capture["lines"]` untouched."""
+    lines = capture["lines"]
+    if mode == "routing-log":
+        capture["aggregate"] = aggregate_routing_observations(
+            lines, args.routing_layer_field, args.routing_row_field, args.routing_expert_field
+        )
+    elif mode == "arms":
+        capture["aggregate"] = aggregate_arm_observations(
+            lines, args.arm_site_field, args.arm_field
+        )
+
+
 def build_plain_runner(args: argparse.Namespace):
     import mistralrs
 
@@ -341,6 +463,7 @@ def run_equality_like(args: argparse.Namespace) -> dict[str, Any]:
     capture: dict[str, Any] | None = None
     if capture_needed and capture_paths is not None:
         capture = scan_captured_streams(capture_paths, pattern)
+        aggregate_capture(args.mode, capture, args)
 
     content = "".join(s["delta"] for s in steps)
     token_ids = [s["token_id"] for s in steps]
@@ -406,6 +529,14 @@ def run_child(args: argparse.Namespace, flag: str) -> Path:
         cmd += ["--capture-pattern", args.capture_pattern]
     if args.rust_log:
         cmd += ["--rust-log", args.rust_log]
+    for flag, value in (
+        ("--arm-site-field", args.arm_site_field),
+        ("--arm-field", args.arm_field),
+        ("--routing-layer-field", args.routing_layer_field),
+        ("--routing-row-field", args.routing_row_field),
+        ("--routing-expert-field", args.routing_expert_field),
+    ):
+        cmd += [flag, value]
     if args.label:
         cmd += ["--label", args.label]
 
@@ -428,16 +559,99 @@ def run_child(args: argparse.Namespace, flag: str) -> Path:
     return reported_path
 
 
+def compare_arm_aggregates(agg_a: dict[str, Any], agg_b: dict[str, Any]) -> dict[str, Any]:
+    """Per site per arm, which counts moved between the two runs."""
+    counts_a, counts_b = agg_a["counts"], agg_b["counts"]
+    differences = []
+    for site in sorted(set(counts_a) | set(counts_b)):
+        arms_a, arms_b = counts_a.get(site, {}), counts_b.get(site, {})
+        for arm in sorted(set(arms_a) | set(arms_b)):
+            a, b = arms_a.get(arm, 0), arms_b.get(arm, 0)
+            if a != b:
+                differences.append({"site": site, "arm": arm, "count_a": a, "count_b": b})
+    return {
+        "kind": "arms",
+        "equal": not differences,
+        "sites_only_in_a": sorted(set(counts_a) - set(counts_b)),
+        "sites_only_in_b": sorted(set(counts_b) - set(counts_a)),
+        "differences": differences,
+    }
+
+
+def compare_routing_aggregates(agg_a: dict[str, Any], agg_b: dict[str, Any]) -> dict[str, Any]:
+    """Per layer/row, the first forward at which the two runs chose different experts."""
+    seqs_a, seqs_b = agg_a["sequences"], agg_b["sequences"]
+    differences = []
+    for key in sorted(set(seqs_a) & set(seqs_b)):
+        a, b = seqs_a[key], seqs_b[key]
+        first = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
+        if first is None and len(a) != len(b):
+            first = min(len(a), len(b))
+        if first is not None:
+            differences.append({
+                "key": key,
+                "first_divergent_forward": first,
+                "len_a": len(a),
+                "len_b": len(b),
+                "tail_a": a[first:],
+                "tail_b": b[first:],
+            })
+    only_a = sorted(set(seqs_a) - set(seqs_b))
+    only_b = sorted(set(seqs_b) - set(seqs_a))
+    return {
+        "kind": "routing",
+        "equal": not differences and not only_a and not only_b,
+        "keys_only_in_a": only_a,
+        "keys_only_in_b": only_b,
+        "differences": differences,
+    }
+
+
+def compare_captures(report_a: dict[str, Any], report_b: dict[str, Any]) -> dict[str, Any] | None:
+    """Diff the two runs' capture aggregates, or say why they cannot be diffed.
+
+    A run with nothing captured is not "equal"; at this tip neither plan 03's routing line nor plan
+    04's nine arm messages exist, so `no_observations` is the expected answer and must not be
+    mistaken for evidence that routing agrees.
+    """
+    agg_a = (report_a.get("capture") or {}).get("aggregate")
+    agg_b = (report_b.get("capture") or {}).get("aggregate")
+    if agg_a is None or agg_b is None:
+        return None
+    if agg_a["kind"] != agg_b["kind"]:
+        return {"comparable": False, "reason": "the two runs aggregated different capture kinds"}
+    if not agg_a["num_observations"] and not agg_b["num_observations"]:
+        return {
+            "comparable": False,
+            "kind": agg_a["kind"],
+            "reason": "neither run produced a parsed observation, so there is nothing to diff "
+            "(no instrumentation, wrong --capture-pattern, or wrong field names)",
+            "num_unparsed_lines_a": agg_a["num_unparsed_lines"],
+            "num_unparsed_lines_b": agg_b["num_unparsed_lines"],
+        }
+    diff = (compare_routing_aggregates if agg_a["kind"] == "routing" else compare_arm_aggregates)(
+        agg_a, agg_b
+    )
+    diff["comparable"] = True
+    diff["num_observations_a"] = agg_a["num_observations"]
+    diff["num_observations_b"] = agg_b["num_observations"]
+    return diff
+
+
 def compare_reports(report_a: dict[str, Any], report_b: dict[str, Any]) -> dict[str, Any]:
     ids_a = report_a["response"]["token_ids"]
     ids_b = report_b["response"]["token_ids"]
+    capture_diff = compare_captures(report_a, report_b)
 
     if ids_a is None or ids_b is None:
-        return {
+        result = {
             "comparable": False,
             "reason": "one or both runs did not return a complete token id list "
             "(model/backend may not have returned logprobs)",
         }
+        if capture_diff is not None:
+            result["capture"] = capture_diff
+        return result
 
     first_divergence = None
     for i, (a, b) in enumerate(zip(ids_a, ids_b)):
@@ -461,7 +675,21 @@ def compare_reports(report_a: dict[str, Any], report_b: dict[str, Any]) -> dict[
         result["tail_b"] = ids_b[first_divergence:]
         result["content_a"] = report_a["response"]["content"]
         result["content_b"] = report_b["response"]["content"]
+
+    if capture_diff is not None:
+        result["capture"] = capture_diff
+        result["verdict"] = capture_verdict(equal, capture_diff)
     return result
+
+
+def capture_verdict(tokens_equal: bool, capture_diff: dict[str, Any]) -> str:
+    """Name the row of plan 03's outcome table this pair of runs lands on."""
+    if not tokens_equal:
+        return "tokens differ"
+    if not capture_diff.get("comparable", False):
+        return "tokens identical; capture not comparable"
+    noun = "expert indices" if capture_diff["kind"] == "routing" else "arm counts"
+    return f"tokens identical; {noun} {'identical' if capture_diff['equal'] else 'differ'}"
 
 
 def write_compare_summary(path: Path, flag_a: str, flag_b: str, path_a: Path, path_b: Path,
@@ -489,8 +717,48 @@ def write_compare_summary(path: Path, flag_a: str, flag_b: str, path_a: Path, pa
             f"- content a: {diff['content_a']!r}",
             f"- content b: {diff['content_b']!r}",
         ]
+    lines += capture_summary_lines(diff.get("capture"))
+    if "verdict" in diff:
+        lines += ["", f"**Verdict:** {diff['verdict']}."]
     path.write_text("\n".join(lines) + "\n")
     print(f"wrote {path}", file=sys.stderr)
+
+
+def capture_summary_lines(capture_diff: dict[str, Any] | None) -> list[str]:
+    if capture_diff is None:
+        return []
+    lines = ["", "## Capture"]
+    if not capture_diff.get("comparable", False):
+        return lines + ["", f"**Not comparable:** {capture_diff['reason']}"]
+
+    kind = capture_diff["kind"]
+    lines += ["", f"- kind: {kind}",
+              f"- observations a / b: {capture_diff['num_observations_a']} / "
+              f"{capture_diff['num_observations_b']}"]
+    if capture_diff["equal"]:
+        return lines + ["", f"**{kind.capitalize()} identical.**"]
+
+    lines += ["", f"**{kind.capitalize()} differs.**", ""]
+    if kind == "routing":
+        for only, side in (("keys_only_in_a", "a"), ("keys_only_in_b", "b")):
+            if capture_diff[only]:
+                lines.append(f"- keys only in {side}: `{capture_diff[only]}`")
+        for entry in capture_diff["differences"]:
+            lines.append(
+                f"- `{entry['key']}`: first divergent forward {entry['first_divergent_forward']}, "
+                f"len {entry['len_a']} / {entry['len_b']}, "
+                f"tail a `{entry['tail_a']}` vs tail b `{entry['tail_b']}`"
+            )
+    else:
+        for only, side in (("sites_only_in_a", "a"), ("sites_only_in_b", "b")):
+            if capture_diff[only]:
+                lines.append(f"- sites only in {side}: `{capture_diff[only]}`")
+        for entry in capture_diff["differences"]:
+            lines.append(
+                f"- `{entry['site']}` arm `{entry['arm']}`: "
+                f"{entry['count_a']} vs {entry['count_b']}"
+            )
+    return lines
 
 
 def do_compare(args: argparse.Namespace) -> None:
@@ -510,7 +778,12 @@ def do_compare(args: argparse.Namespace) -> None:
     write_compare_summary(summary_path, "off", "on", path_off, path_on, diff)
 
     print(json.dumps(diff, indent=2))
-    if diff.get("comparable") and not diff["equal"]:
+    # nonzero means "the two runs diverged somewhere", now including routing/arm divergence at
+    # identical tokens -- which is exactly plan 03's "identical / differ" table row.
+    tokens_diverged = diff.get("comparable") and not diff["equal"]
+    capture = diff.get("capture") or {}
+    capture_diverged = capture.get("comparable") and not capture["equal"]
+    if tokens_diverged or capture_diverged:
         sys.exit(1)
 
 
@@ -838,8 +1111,21 @@ def add_common_request_args(p: argparse.ArgumentParser) -> None:
                          "logging alone for --mode equality and sets MISTRALRS_DEBUG=1 for the "
                          "routing-log/arms capture modes (their instrumentation is debug level).")
     p.add_argument("--capture-pattern", default=None,
-                    help="routing-log/arms mode only: regex over captured stderr lines "
+                    help="routing-log/arms mode only: regex selecting captured log lines "
                          "(default depends on mode)")
+    p.add_argument("--arm-site-field", default=DEFAULT_ARM_SITE_FIELD,
+                    help="arms mode: tracing field naming the recurrent site (default: "
+                         "%(default)s)")
+    p.add_argument("--arm-field", default=DEFAULT_ARM_FIELD,
+                    help="arms mode: tracing field naming which arm ran (default: %(default)s)")
+    p.add_argument("--routing-layer-field", default=DEFAULT_ROUTING_LAYER_FIELD,
+                    help="routing-log mode: tracing field naming the layer (default: %(default)s)")
+    p.add_argument("--routing-row-field", default=DEFAULT_ROUTING_ROW_FIELD,
+                    help="routing-log mode: tracing field naming the batch row (default: "
+                         "%(default)s)")
+    p.add_argument("--routing-expert-field", default=DEFAULT_ROUTING_EXPERT_FIELD,
+                    help="routing-log mode: tracing field naming the topk(1) expert index "
+                         "(default: %(default)s)")
 
 
 def cmd_run(args: argparse.Namespace) -> None:

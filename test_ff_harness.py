@@ -18,7 +18,9 @@ import io
 import json
 import os
 import re
+import pathlib
 import socket
+import tempfile
 import sys
 import threading
 import time
@@ -516,6 +518,224 @@ class LoggingConfigTest(unittest.TestCase):
                                   "--rust-log", "mistralrs=debug"])
         self.assertEqual(run.rust_log, "mistralrs=debug")
         self.assertEqual(cmp_.rust_log, "mistralrs=debug")
+
+
+# What `tracing_subscriber::fmt` renders for a `tracing::debug!(site = ..., arm = ..., "msg")`.
+# The instrumentation these lines would come from does not exist yet at this tip -- see
+# reports/04-recurrent-site-audit.md -- so these are the shape the harness must be able to consume,
+# not a transcript of a real run.
+def _arm_line(site, arm, stream="stdout"):
+    return {"stream": stream,
+            "line": f'2026-09-10T00:00:00.1Z DEBUG mistralrs_core::pipeline: recurrent site arm '
+                    f'site="{site}" arm={arm}'}
+
+
+def _routing_line(layer, row, expert, stream="stdout"):
+    return {"stream": stream,
+            "line": f'2026-09-10T00:00:00.1Z DEBUG mistralrs_core::amoe: expert selected '
+                    f'layer={layer} row={row} expert={expert}'}
+
+
+class TracingFieldTest(unittest.TestCase):
+    """F5: consume the key=value rendering this tree already uses for structured tracing fields."""
+
+    def test_quoted_and_bare_values(self):
+        fields = ffh.parse_tracing_fields(_arm_line("gdn/layer.rs:532", "speculative")["line"])
+        self.assertEqual(fields["site"], "gdn/layer.rs:532")
+        self.assertEqual(fields["arm"], "speculative")
+
+    def test_numeric_fields(self):
+        fields = ffh.parse_tracing_fields(_routing_line(3, 1, 7)["line"])
+        self.assertEqual((fields["layer"], fields["row"], fields["expert"]), ("3", "1", "7"))
+
+    def test_escaped_quote_inside_a_value(self):
+        self.assertEqual(
+            ffh.parse_tracing_fields(r'msg site="a\"b" arm=x')["site"], 'a"b')
+
+    def test_a_line_with_no_fields_yields_nothing_useful(self):
+        self.assertEqual(ffh.parse_tracing_fields("DEBUG plain message with no fields"), {})
+
+    def test_the_existing_splice_line_shape_parses(self):
+        # mistralrs-core/src/pipeline/sampling.rs:1636
+        fields = ffh.parse_tracing_fields(
+            "2026-09-10T00:00:00.1Z DEBUG mistralrs_core: fast-forward splice computed splice_len=3")
+        self.assertEqual(fields["splice_len"], "3")
+
+
+class ArmAggregateTest(unittest.TestCase):
+    """F5 / plan 05: "aggregated to a count per site per arm in the JSON report"."""
+
+    def setUp(self):
+        self.lines = [
+            _arm_line("gdn/layer.rs:532", "decode"),
+            _arm_line("gdn/layer.rs:532", "decode"),
+            _arm_line("gdn/layer.rs:532", "speculative"),
+            _arm_line("pipeline/normal.rs:2210", "decode", stream="stderr"),
+        ]
+
+    def test_counts_are_per_site_per_arm(self):
+        agg = ffh.aggregate_arm_observations(self.lines, "site", "arm")
+        self.assertEqual(agg["counts"], {
+            "gdn/layer.rs:532": {"decode": 2, "speculative": 1},
+            "pipeline/normal.rs:2210": {"decode": 1},
+        })
+        self.assertEqual(agg["num_observations"], 4)
+        self.assertEqual(agg["sites"], ["gdn/layer.rs:532", "pipeline/normal.rs:2210"])
+        self.assertEqual(agg["arms"], ["decode", "speculative"])
+
+    def test_all_nine_sites_aggregate_independently(self):
+        sites = [
+            "gdn/layer.rs:532", "vision_models/qwen3_5/text.rs:850",
+            "vision_models/qwen3_5/text.rs:2321", "pipeline/normal.rs:2210",
+            "pipeline/multimodal.rs:1874", "pipeline/multimodal.rs:2233",
+            "vision_models/mod.rs:184", "vision_models/mod.rs:243",
+            "pipeline/cuda_graph.rs:2379",
+        ]
+        agg = ffh.aggregate_arm_observations([_arm_line(s, "decode") for s in sites], "site", "arm")
+        self.assertEqual(len(agg["counts"]), 9)
+
+    def test_wrong_field_names_show_up_as_unparsed(self):
+        agg = ffh.aggregate_arm_observations(self.lines, "call_site", "branch")
+        self.assertEqual(agg["num_observations"], 0)
+        self.assertEqual(agg["num_unparsed_lines"], 4)
+        self.assertTrue(agg["unparsed_examples"])
+
+    def test_configurable_field_names(self):
+        line = {"stream": "stdout", "line": 'msg where="x" which=spec'}
+        agg = ffh.aggregate_arm_observations([line], "where", "which")
+        self.assertEqual(agg["counts"], {"x": {"spec": 1}})
+
+
+class RoutingAggregateTest(unittest.TestCase):
+    """F5 / plan 03 Part B: the topk(1) index per forward, keyed by layer and batch row."""
+
+    def test_sequences_are_keyed_by_layer_and_row(self):
+        agg = ffh.aggregate_routing_observations(
+            [_routing_line(0, 0, 3), _routing_line(0, 1, 5), _routing_line(0, 0, 3),
+             _routing_line(1, 0, 2)], "layer", "row", "expert")
+        self.assertEqual(agg["sequences"], {
+            "layer=0,row=0": ["3", "3"],
+            "layer=0,row=1": ["5"],
+            "layer=1,row=0": ["2"],
+        })
+        self.assertEqual(agg["counts"]["layer=0,row=0"], {"3": 2})
+        self.assertEqual(agg["num_observations"], 4)
+
+    def test_emission_order_is_preserved(self):
+        agg = ffh.aggregate_routing_observations(
+            [_routing_line(0, 0, e) for e in (1, 4, 1, 9)], "layer", "row", "expert")
+        self.assertEqual(agg["sequences"]["layer=0,row=0"], ["1", "4", "1", "9"])
+
+    def test_missing_layer_field_is_unparsed_not_silently_dropped(self):
+        line = {"stream": "stdout", "line": "expert selected row=0 expert=3"}
+        agg = ffh.aggregate_routing_observations([line], "layer", "row", "expert")
+        self.assertEqual(agg["num_observations"], 0)
+        self.assertEqual(agg["num_unparsed_lines"], 1)
+
+
+def _report(token_ids, capture=None):
+    report = {"response": {"token_ids": token_ids, "content": "x", "finish_reason": "stop"}}
+    if capture is not None:
+        report["capture"] = capture
+    return report
+
+
+def _capture(aggregate, lines=()):
+    return {"lines": list(lines), "num_matched_lines": len(lines), "aggregate": aggregate}
+
+
+class CompareCaptureTest(unittest.TestCase):
+    """F5: compare must report routing/arm differences, not only token ids."""
+
+    def _routing(self, lines):
+        return ffh.aggregate_routing_observations(lines, "layer", "row", "expert")
+
+    def _arms(self, lines):
+        return ffh.aggregate_arm_observations(lines, "site", "arm")
+
+    def test_identical_tokens_identical_routing(self):
+        agg = self._routing([_routing_line(0, 0, 3)])
+        diff = ffh.compare_reports(_report([1, 2], _capture(agg)), _report([1, 2], _capture(agg)))
+        self.assertTrue(diff["equal"])
+        self.assertTrue(diff["capture"]["equal"])
+        self.assertEqual(diff["verdict"], "tokens identical; expert indices identical")
+
+    def test_identical_tokens_differing_routing(self):
+        """Plan 03's second table row: equality of tokens is luck of one checkpoint."""
+        a = self._routing([_routing_line(0, 0, 3), _routing_line(0, 0, 3)])
+        b = self._routing([_routing_line(0, 0, 3), _routing_line(0, 0, 5)])
+        diff = ffh.compare_reports(_report([1, 2], _capture(a)), _report([1, 2], _capture(b)))
+        self.assertTrue(diff["equal"])
+        self.assertFalse(diff["capture"]["equal"])
+        entry = diff["capture"]["differences"][0]
+        self.assertEqual(entry["key"], "layer=0,row=0")
+        self.assertEqual(entry["first_divergent_forward"], 1)
+        self.assertEqual((entry["tail_a"], entry["tail_b"]), (["3"], ["5"]))
+        self.assertEqual(diff["verdict"], "tokens identical; expert indices differ")
+
+    def test_differing_tokens_short_circuits_the_verdict(self):
+        agg = self._routing([_routing_line(0, 0, 3)])
+        diff = ffh.compare_reports(_report([1, 2], _capture(agg)), _report([1, 9], _capture(agg)))
+        self.assertFalse(diff["equal"])
+        self.assertEqual(diff["verdict"], "tokens differ")
+
+    def test_a_key_seen_in_only_one_run_counts_as_a_difference(self):
+        a = self._routing([_routing_line(0, 0, 3)])
+        b = self._routing([_routing_line(0, 0, 3), _routing_line(1, 0, 4)])
+        diff = ffh.compare_reports(_report([1], _capture(a)), _report([1], _capture(b)))
+        self.assertFalse(diff["capture"]["equal"])
+        self.assertEqual(diff["capture"]["keys_only_in_b"], ["layer=1,row=0"])
+
+    def test_arm_counts_are_diffed_per_site_per_arm(self):
+        a = self._arms([_arm_line("s1", "decode"), _arm_line("s1", "decode")])
+        b = self._arms([_arm_line("s1", "decode"), _arm_line("s1", "speculative")])
+        diff = ffh.compare_reports(_report([1], _capture(a)), _report([1], _capture(b)))
+        self.assertFalse(diff["capture"]["equal"])
+        self.assertEqual(
+            diff["capture"]["differences"],
+            [{"site": "s1", "arm": "decode", "count_a": 2, "count_b": 1},
+             {"site": "s1", "arm": "speculative", "count_a": 0, "count_b": 1}])
+        self.assertEqual(diff["verdict"], "tokens identical; arm counts differ")
+
+    def test_two_empty_captures_are_not_reported_as_equal(self):
+        """No instrumentation at this tip: that is 'nothing to diff', not 'routing agrees'."""
+        empty = self._routing([])
+        diff = ffh.compare_reports(_report([1], _capture(empty)), _report([1], _capture(empty)))
+        self.assertFalse(diff["capture"]["comparable"])
+        self.assertIn("nothing to diff", diff["capture"]["reason"])
+        self.assertEqual(diff["verdict"], "tokens identical; capture not comparable")
+
+    def test_plain_equality_mode_has_no_capture_section(self):
+        diff = ffh.compare_reports(_report([1, 2]), _report([1, 2]))
+        self.assertNotIn("capture", diff)
+        self.assertNotIn("verdict", diff)
+
+    def test_capture_is_reported_even_when_token_ids_are_missing(self):
+        a = self._routing([_routing_line(0, 0, 3)])
+        b = self._routing([_routing_line(0, 0, 5)])
+        diff = ffh.compare_reports(_report(None, _capture(a)), _report(None, _capture(b)))
+        self.assertFalse(diff["comparable"])
+        self.assertFalse(diff["capture"]["equal"])
+
+    def test_raw_lines_survive_alongside_the_aggregate(self):
+        lines = [_routing_line(0, 0, 3)]
+        capture = _capture(self._routing(lines), lines)
+        self.assertEqual(capture["lines"], lines)
+        self.assertEqual(capture["aggregate"]["num_observations"], 1)
+
+    def test_summary_markdown_names_the_divergence(self):
+        a = self._routing([_routing_line(0, 0, 3)])
+        b = self._routing([_routing_line(0, 0, 5)])
+        diff = ffh.compare_reports(_report([1], _capture(a)), _report([1], _capture(b)))
+        with tempfile.TemporaryDirectory() as tmp:
+            out = pathlib.Path(tmp) / "summary.md"
+            with contextlib.redirect_stderr(io.StringIO()):
+                ffh.write_compare_summary(
+                    out, "off", "on", pathlib.Path("a"), pathlib.Path("b"), diff)
+            text = out.read_text()
+        self.assertIn("## Capture", text)
+        self.assertIn("layer=0,row=0", text)
+        self.assertIn("Verdict:", text)
 
 
 def _free_port() -> int:
