@@ -1,0 +1,42 @@
+{
+  "plan": "06",
+  "purpose": "Attempt 1 of the plan-06 FF-activation precondition: non-GGUF HF checkpoint via ff_harness.py equality mode.",
+  "outcome": "failed_before_inference",
+  "not_an_ff_measurement": true,
+  "environment": {
+    "container": "fresh session, distinct from the 2026-09-10 CUDA smoke-test container recorded in reports/05-harness.md",
+    "git_branch": "ff-demo-artifacts",
+    "cuda_runtime": "absent -- no libcudart.so.12/libcuda.so.1 found on the filesystem (ldconfig -p empty for both), no /dev/nvidia* device nodes",
+    "nvidia_driver": "kernel-level nvidia device majors are registered (/proc/devices lists nvidia, nvidia-uvm, etc.) but no device nodes are present in this container, i.e. host has a driver but the GPU is not passed through to this session",
+    "cargo_rustc": "not installed (which cargo / which rustc: empty)",
+    "prebuilt_cuda_binary": "/workspace/target/debug/mistralrs exists on disk (leftover build artifact, CUDA feature linked: strings show libcudart.so.12/cudaMalloc/etc.) but fails to start: 'error while loading shared libraries: libcudart.so.12: cannot open shared object file: No such file or directory'",
+    "python_wheel_used": "/workspace/mistralrs-0.9.3-cp310-abi3-manylinux_2_35_x86_64.whl (committed on ff-demo-artifacts). Confirmed CPU-only: ldd mistralrs/mistralrs.abi3.so has no libcuda/libcudart dependency at all.",
+    "hf_cache": "empty at session start (no ~/.cache/huggingface/hub entries, no local GGUF or tokenizer.json files found on disk)",
+    "network": "outbound HTTPS reachable (pypi.org, huggingface.co both returned 200)"
+  },
+  "command": "PYTHONPATH=/tmp/whl_extract MISTRALRS_GRAMMAR_FAST_FORWARD=1 python3 ff_harness.py run --mode equality --flag on --model-id Qwen/Qwen2.5-0.5B-Instruct --arch Qwen2 --max-tokens 4 --seed 1 --schema-file plans/ff-round-two/fixtures/partial.schema.json --plan attempt1 --label smoke",
+  "flag_env_value_intended": "1",
+  "model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+  "arch": "Qwen2",
+  "schema_file": "plans/ff-round-two/fixtures/partial.schema.json",
+  "seed": 1,
+  "max_tokens": 4,
+  "traceback_tail": [
+    "File \"/workspace/ff_harness.py\", line 1289, in <module>",
+    "    main()",
+    "File \"/workspace/ff_harness.py\", line 1210, in cmd_run",
+    "    report = run_equality_like(args)",
+    "File \"/workspace/ff_harness.py\", line 498, in run_equality_like",
+    "    runner = build_plain_runner(args)",
+    "File \"/workspace/ff_harness.py\", line 464, in build_plain_runner",
+    "    return mistralrs.Runner(**runner_kwargs)",
+    "ValueError: cannot seed the CPU rng with set_seed"
+  ],
+  "diagnosis": {
+    "reproduced_minimally": "mistralrs.Runner(which=Which.Plain(model_id='Qwen/Qwen2.5-0.5B-Instruct', arch=Architecture.Qwen2), seed=42) raises the same ValueError immediately, before any network request (no partial download appeared under ~/.cache/huggingface).",
+    "root_cause_located": "candle-core's CPU RNG device in this build has no settable seed: the wheel's compiled strings include the literal pair 'cannot get the CPU rng seed with get_current_seed' / 'cannot seed the CPU rng with set_seed', both unconditional (not model- or dtype-gated).",
+    "confirms_device_specific_not_ff_specific": "Runner(which=..., seed=None) (bypassing ff_harness.py, diagnostic only) proceeds past construction and starts downloading the model -- confirmed by an INFO log line ('Could not load token at ... using no HF token') and network activity, cut off only by a 15s diagnostic timeout. So the blocker is specifically 'a concrete seed value passed to Runner on a CPU device', not the model id, tokenizer, or grammar.",
+    "why_the_harness_cannot_avoid_it": "ff_harness.py's argparse defines --seed with default=42 (never None) and build_plain_runner() passes runner_kwargs = dict(which=which, seed=args.seed) unconditionally -- there is no CLI flag to omit seed. Per this task's constraints, ff_harness.py was not modified to route around this."
+  },
+  "conclusion": "This is a container/build capability gap (CPU-only wheel + a harness interface that always seeds + no CUDA/Metal device available to construct a Runner that supports set_seed), not a finding about grammar fast-forward. No inference was reached, so this run says nothing about mistralrs_grammar_ff_splices_staged_total."
+}
