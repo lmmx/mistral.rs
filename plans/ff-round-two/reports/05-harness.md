@@ -1,9 +1,15 @@
 # 05 -- The experimental harness
 
-Status: implemented, locally validated at the Python-syntax/argument-parsing/helper-logic level.
-Not run end-to-end against a live model -- no Rust toolchain, no built `mistralrs-cli`/server
-binary, and no downloaded model in this session, consistent with every prior report in this plan
-set.
+Status: implemented, locally validated at the Python level (syntax, argument parsing, helper logic,
+and a stdlib-`http.server` stub for the HTTP paths). Not run end-to-end against a live model -- no
+Rust toolchain, no built `mistralrs-cli`/server binary, and no downloaded model in any session so
+far, consistent with every prior report in this plan set.
+
+A later audit of this harness found five problems and they have since been fixed on this branch;
+"Audit follow-up" at the end of this document lists them, and the sections below describe the
+harness as it stands after those fixes. Nothing in that follow-up changes what is and is not
+experimentally verified: still no live inference, no CUDA run, no AnyMoE routing evidence and no
+recurrent-site arm counts.
 
 ## Where the harness lives, and why
 
@@ -35,6 +41,12 @@ One new file, `ff_harness.py`, committed to `ff-demo-artifacts` beside the exist
   "retry_count": ...}`, `additionalProperties: false`, so braces/keys/colons/ordering are forced)
   and leaves free spans open: `status` is a 4-member enum, `message` is a free string, `retry_count`
   is a free-choice integer in range.
+- `plans/ff-round-two/fixtures/{narrow,nested,wide}.schema.json` (added by the audit follow-up) --
+  the differing-forced-span set plan 06 workload B needs. Same partially-forcing shape, but the
+  amount of literal text the grammar forces differs by roughly 9x across the set (structural
+  characters: narrow 12, partial 37, nested 72, wide 112). `nested` additionally carries a forced
+  run in the middle of the object, where the inner object closes and the next key begins, rather
+  than only at the head.
 
 `RESULTS.md` and `ff_bench.py` were not read for modification and were not touched, per the plan.
 
@@ -74,11 +86,30 @@ request shape (model id, arch, dtype, seed, prompt, schema file path, max tokens
 
 ### `routing-log`
 
-`equality` plus best-effort capture: `os.dup2` redirects the real OS-level fd 2 (not Python's
-`sys.stderr` object -- required because Rust's tracing subscriber writes to the process's actual
-stderr fd) to a temp file for the duration of the request, then greps it against a regex (default
-`EXPERT_IDX`, overridable via `--capture-pattern`) and stores matched lines plus a count in the
-report's `capture` object.
+`equality` plus best-effort capture: `os.dup2` redirects the real OS-level fds 1 *and* 2 (not
+Python's `sys.stdout`/`sys.stderr` objects -- required because Rust's tracing subscriber writes to
+real fds) to temp files for the duration of the request, then greps them against a regex (default
+`EXPERT_IDX`, overridable via `--capture-pattern`) and stores the matched lines, each tagged with
+the stream it came from, in the report's `capture` object.
+
+Both streams, not just stderr, because which one the subscriber uses is *not* pinned down by
+anything readable here: `initialize_logging` builds `tracing_subscriber::fmt()` and never calls
+`.with_writer(...)` (`mistralrs-core/src/utils/debug.rs:47`), so the destination is that crate's
+default `MakeWriter`, and `tracing-subscriber` 0.3.22's source is not vendored in this checkout
+(no `cargo`, no registry, no `vendor/`) to confirm which fd that is. Capturing both makes the
+question moot rather than guessed.
+
+Two numbers in the report make a null result readable: `capture.lines_seen` (per stream) and
+`capture.total_lines_seen`, alongside `capture.num_matched_lines`. Zero matches out of zero lines
+seen means the capture never saw output at all; zero matches out of a few thousand lines means the
+instrumentation genuinely emitted nothing matching. The `logging` block records `RUST_LOG`,
+`MISTRALRS_DEBUG` and whether they were set before the `import mistralrs` that fixes the tracing
+filter in a `OnceLock` (`mistralrs-pyo3/src/lib.rs:3223` calls `initialize_logging()` from the
+`#[pymodule]` initialiser, so a later change to those variables does nothing).
+
+The capture modes set `MISTRALRS_DEBUG=1` themselves, overridable with `--rust-log`. Without it the
+filter is `warn` plus `mistralrs=info` (`utils/debug.rs:29-62`) and plan 03's routing line and plan
+04's nine arm messages -- both `tracing::debug!` -- would be dropped before reaching any fd.
 
 **This currently captures nothing.** Reading `mistralrs-core/src/amoe/mod.rs` on
 `grammar-fast-forward` (`MoeMlp::forward`, around the `topk(1)` call cited by
@@ -94,7 +125,8 @@ for today's tree.
 
 ### `arms`
 
-Same shape as `routing-log`, default pattern `\bARM\b`, for the nine recurrent-site arm messages
+Same shape as `routing-log` (both streams, debug logging on, same `lines_seen` accounting), default
+pattern `\bARM\b`, for the nine recurrent-site arm messages
 `reports/04-recurrent-site-audit.md` describes. Same caveat: that report's Deliverable 2 (adding the
 `tracing::debug!` calls) was not run either, so this mode also captures nothing at this tip. Built
 as the same generic stderr-capture mechanism as `routing-log` rather than a second implementation,
@@ -104,18 +136,42 @@ what's being grepped for.
 ### `concurrency`
 
 Launches an HTTP server as a subprocess via a user-supplied `--server-cmd` (the harness does not
-hardcode `mistralrs-cli serve` flags -- this session could not verify the exact current flag names
+hardcode `mistralrs-cli serve` flags -- no session so far could verify the exact current flag names
 against a built binary, so inventing them risked shipping a wrong command; the caller passes the
-full command line instead). Polls `GET /health` until 200 or `--startup-timeout-seconds` elapses.
-Builds `N` (`--num-requests`) request bodies, a `--unconstrained-fraction` of them with no grammar
-at all and the rest carrying a grammar drawn from `--schema-files` (`identical`: all the same file;
-`differing`: round-robin), fires them concurrently via `ThreadPoolExecutor` against
-`POST /v1/chat/completions`, scrapes `GET /metrics` immediately before and after the burst, and
-reports the deltas for every line matching the `mistralrs_grammar_ff_` prefix (covers
-`_splices_staged_total`, `_tokens_fed_total`, `_splice_drops_total{reason=...}`, and
-`_tokens_dropped_total{reason=...}` from plan 02, without hardcoding individual metric names so a
-future counter is picked up automatically). The server subprocess is terminated in a `finally`
-block regardless of outcome.
+full command line instead, as one shell-quoted string that the harness splits with `shlex`). Polls
+`GET /health` until 200 or `--startup-timeout-seconds` elapses.
+
+`plan_concurrency_requests` then derives the whole schedule from `--seed`: which of the `N`
+(`--num-requests`) slots go unconstrained (sampled, so they are not always the first ones submitted)
+and which fixture each constrained slot carries -- `identical` uses the first file, `differing`
+round-robins over a seeded shuffle of `--schema-files`, so every slot gets a distinct schema while
+`N` fits the fixture set. `--stagger-seconds` delays request `i` by `i *` that value, covering plan
+06's "stagger request start times in at least one variant"; at 0 the start is synchronised as
+before. Requests fire concurrently via `ThreadPoolExecutor` against `POST /v1/chat/completions`.
+
+Request bodies use the HTTP route's own shape, which is *not* the Python API's:
+`mistralrs-server-core/src/openai.rs` has no `grammar_type` field and its `grammar` is
+`#[serde(tag = "type", content = "value")]`, so the schema goes out as
+`{"type": "json_schema", "value": {...}}`. `seed` is a real field on that struct (`openai.rs:1180`,
+covered by its own test at `:2139`), so the run's seed reaches the server rather than only shaping
+the client-side schedule.
+
+`GET /metrics` is scraped immediately before and after the burst and the deltas reported for every
+sample whose name starts with one of `--metric-prefix` (default `mistralrs_`). That default covers
+plan 02's `mistralrs_grammar_ff_*` counters for dimensions 1-2 *and*
+`mistralrs_decode_tokens_processed_total` / `mistralrs_prefill_tokens_processed_total` for dimension
+5 and `mistralrs_paged_preemptions_total` / `mistralrs_kv_cache_blocks_*` for dimension 6. Label
+sets stay in the sample key, so `_splice_drops_total{reason="batch_shape"}` remains separable from
+the other drop reasons, which dimension 1 requires. Passing `--metric-prefix
+mistralrs_grammar_ff_` narrows back to the fast-forward counters; passing `--metric-prefix` with no
+value keeps everything. Individual metric names are never hardcoded, so a future counter is picked
+up automatically. The server subprocess is terminated in a `finally` block regardless of outcome.
+
+The report records the parameters needed to re-run it: seed (and the seed sent on the wire),
+prompt, `unconstrained_fraction`, `stagger_seconds`, `schema_set`, the resolved `schema_files`, the
+metric prefixes, `max_tokens`, the startup timeout, and both the argv list and the raw string of
+`--server-cmd`. Per request it records the schema file used, the scheduled offset and the observed
+start offset alongside latency, status and finish reason.
 
 Not implemented, and explicitly out of scope: plan 06's "batch composition histogram" (dimension 3)
 requires a new counter/histogram in `mistralrs-core` that plan 06 itself calls out as "the one code
@@ -124,10 +180,17 @@ that does not require that addition (dimensions 1, 2, and the raw ingredients fo
 (per-batch minimum splice width) is likewise not observable from outside the process without new
 instrumentation and is left to plan 06.
 
+Also still not enforced: plan 06 needs a build where `paged_attn_supported()` is true (CUDA or
+Metal). The harness records `server_cmd` so a reader can tell what was launched, but it does not
+check that the server it talked to was a paged build.
+
 ## Files changed
 
 - `ff_harness.py` (new, `ff-demo-artifacts`)
+- `test_ff_harness.py` (added by the audit follow-up, `ff-demo-artifacts`)
 - `plans/ff-round-two/fixtures/partial.schema.json` (new, `ff-demo-artifacts`)
+- `plans/ff-round-two/fixtures/{narrow,nested,wide}.schema.json` (audit follow-up,
+  `ff-demo-artifacts`)
 - `plans/ff-round-two/reports/05-harness.md` (this report, `ff-demo-artifacts`)
 - No changes on `grammar-fast-forward` (none needed; see "Where the harness lives, and why" above)
 
@@ -142,18 +205,32 @@ All of the following ran in this session, with the exact commands used:
   not importable in this container -- `import mistralrs` resolves to the source-tree namespace
   package with no compiled extension, confirmed by inspecting `sys.modules`/`__path__`).
 - `python3 ff_harness.py run --mode concurrency --flag on --model-id x` (no `--server-cmd`) --
-  correctly errors `--server-cmd is required for --mode concurrency` via the `main()` guard.
-- Inline unit checks (via a scratch script, not committed) against every pure-Python helper that
-  does not require the `mistralrs` extension or a running server: `flag_env` for all three values;
-  `report_path` filename shape against the plan's
-  `<plan>-<mode>-<flag>-<timestamp>.json` pattern (label variant also checked); `METRIC_LINE_RE`
-  against a synthetic Prometheus text body including a labeled counter
-  (`..._splice_drops_total{reason="batch_shape"}`) and a non-`mistralrs_grammar_ff_` line, confirming
-  the prefix filter and label-preserving key; `metric_deltas` arithmetic including a key present in
-  only one snapshot; `compare_reports` for the equal case, the diverging case (correct
-  `first_divergent_index`, tails, decoded content), and the "one side returned no token ids"
-  case (`comparable: false`, no exception); `capture_stderr` actually captures bytes written to the
-  real fd 2 during the `with` block into the temp file.
+  correctly errors `--server-cmd is required for --mode concurrency` via the `main()` guard, which
+  now also validates the command splits, the schema set can differ, and the request plan is
+  constructible, all before anything is launched.
+- `python3 -m unittest test_ff_harness` -- 53 tests, all passing, stdlib only (no pytest in the
+  container). They cover: `parse_server_cmd` on a flagged command line and on quoted arguments;
+  `parse_metrics_body` against a synthetic Prometheus body carrying the fast-forward counters, the
+  token counters, the preemption and KV gauges, a labelled counter, a comment line, junk, and a
+  non-`mistralrs_` family, under the default prefix, a narrowed prefix and an empty prefix list;
+  `metric_deltas` including a key present in only one snapshot; `resolve_schema_files` for the
+  differing/identical defaults, the one-fixture and duplicate-fixture rejections, and a missing
+  file; the four fixtures' JSON validity, partially-forcing shape and distinct forced-span budgets;
+  `build_concurrency_request_body`'s tagged grammar object and optional seed;
+  `plan_concurrency_requests` for seed reproducibility, seed sensitivity, the unconstrained count
+  and its non-head-biased placement, distinct-schema assignment, round-robin overflow, stagger
+  offsets and parameter validation; `capture_std_streams` capturing both real fds and restoring
+  them on the normal and exception paths; `scan_captured_streams` distinguishing zero-of-zero from
+  zero-of-many; `configure_capture_logging` across the capture and non-capture modes, an explicit
+  `--rust-log`, an operator-set `MISTRALRS_DEBUG`, and the already-imported hazard flag.
+- Four of those tests run against a stdlib `http.server` stub on a loopback port -- still no model
+  and no `mistralrs` extension -- confirming `wait_for_health`, `scrape_metrics` over a real socket,
+  that a staggered burst starts in order and still overlaps (four 0.25 s requests finishing in
+  under 0.9 s), that the server receives the tagged grammar object and the seed, and that a
+  connection failure is recorded on the result rather than raised.
+- `python3 ff_harness.py run --mode concurrency ... --server-cmd "mistralrs serve -p 1234 -m foo"`
+  -- reaches `Popen` and fails only with `FileNotFoundError: 'mistralrs'`, i.e. the flagged command
+  line now parses.
 
 **Not run, and why:** any path that constructs a `Runner`, calls `send_chat_completion_request`, or
 launches a server subprocess. All three require either the compiled `mistralrs` Python extension
@@ -162,27 +239,56 @@ installed here per this task's own instructions not to provision one) plus a dow
 `token_ids_complete`/greedy-argmax assumption in `equality` mode, the AnyMoE/arm log line capture in
 `routing-log`/`arms` (moot at this tip regardless, per above), and the `/metrics` scrape format in
 `concurrency` are therefore unverified against a live process and are recorded as such rather than
-assumed correct.
+assumed correct. The stub server exercises the request/metrics *shapes* the harness sends and
+parses; it does not verify that mistral.rs accepts them, only that they match what
+`mistralrs-server-core/src/openai.rs` and `metrics.rs` say on this branch.
 
 ## Ready for plan 06?
 
 `concurrency` mode covers what plan 06 needs from the harness (N concurrent requests, mixed
-constrained/unconstrained, `/metrics` before/after deltas, on a `--server-cmd` the caller supplies)
-for dimensions 1, 2, and the raw numbers behind 5. It does **not** cover dimension 3 (batch
+constrained/unconstrained, identical or genuinely differing schema sets, a seeded and optionally
+staggered schedule, `/metrics` before/after deltas across the whole `mistralrs_` namespace, on a
+`--server-cmd` the caller supplies) for dimensions 1, 2, 5 and the recorded inputs behind 6. It does **not** cover dimension 3 (batch
 composition histogram) or dimension 4 (per-batch minimum splice width) -- those need the
 `mistralrs-core` instrumentation plan 06 reserves for itself, not something plan 05 should have
 added. Plan 06 also needs a paged-attention-capable (CUDA/Metal) build to run `concurrency` mode at
-all (`paged_attn_supported()` is a compile-time `false` on CPU), which this session cannot produce
+all (`paged_attn_supported()` is a compile-time `false` on CPU), which no session so far can produce
 or verify. `equality` and its two extensions are otherwise usable by plans 03 and 04 once a
 toolchain, a model, and (for `routing-log`/`arms`) the missing `mistralrs-core` log lines exist.
+
+## Audit follow-up
+
+A later session audited this harness against plan 05 and returned `PASS WITH ISSUES`. Five findings
+were fixed on `ff-demo-artifacts`; no Rust source was touched and no plan 06 work was done.
+
+| Finding | Problem | Fix |
+|---|---|---|
+| F1 | `--server-cmd` used `nargs="+"`, which stops at the first `-`, so `mistralrs serve -p 1234 -m foo` could not be passed at all and concurrency mode could not launch a server | one shell-quoted string split with `shlex`, validated at parse time |
+| F4 | metrics filtered to a hardcoded `mistralrs_grammar_ff_` prefix, dropping the token, preemption and KV metrics plan 06 dimensions 5 and 6 read | `--metric-prefix`, defaulting to the whole `mistralrs_` namespace, narrowable and disableable |
+| F6 | `--schema-set differing` silently round-robined one fixture, producing workload A while the report said workload B | a four-fixture default set, and a hard error on any explicit set with fewer than two distinct files |
+| F7 | `--seed` never reached concurrency mode, unconstrained requests were always the first slots, and none of the schedule was recorded | seeded schedule, `--stagger-seconds`, and the full parameter set in the report |
+| F2 + F3 | capture watched fd 2 only and left logging at `info`, so a run that never had a chance to see a `tracing::debug!` line looked identical to a real negative | capture both fds, set `MISTRALRS_DEBUG=1` for the capture modes before the import that fixes the filter, record the logging config and the lines-seen totals |
+
+One further defect was fixed because F6 and F7 are meaningless without it: the concurrency request
+body sent the Python API's `grammar_type` + string `grammar`, which the HTTP route cannot
+deserialise, so every constrained request would have been rejected before reaching the model.
+
+Deliberately **not** done, per the audit's own ranking and the follow-up's scope: aggregating the
+`arms` capture per site per arm and diffing routing in the driver (F5), mapping `--anymoe-config-json`
+onto the `AnyMoeExpertType` pyclass it actually needs (F8), and the reproducibility extras -- build
+identity, commit, argv, schema hash -- plus the smaller robustness items (F9). F5 and F8 matter to
+plans 03 and 04 rather than 06; both remain open.
 
 ## Environment note
 
 No Rust toolchain (`cargo`/`rustc`) and no built `mistralrs` Python extension or server binary were
 present in this container. All of the above was written and validated by reading source
 (`mistralrs.pyi` extracted from the committed wheel `mistralrs-0.9.3-cp310-abi3-*.whl`, and
-`mistralrs-core`/`mistralrs-server-core` source on `grammar-fast-forward` via `git show`) and by
-exercising the harness's pure-Python logic directly, not by running inference.
+`mistralrs-core`/`mistralrs-server-core`/`mistralrs-pyo3` source on `grammar-fast-forward`) and by
+exercising the harness's pure-Python logic directly, not by running inference. One thing that could
+*not* be settled by reading: `tracing-subscriber` 0.3.22 is a registry dependency with no vendored
+copy here, so its default `MakeWriter` (stdout or stderr) is unverified -- which is why the capture
+takes both fds rather than picking one.
 
 ## Source commit
 
