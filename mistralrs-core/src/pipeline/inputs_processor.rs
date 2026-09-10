@@ -1559,6 +1559,17 @@ pub mod text_models_inputs_processor {
         // speculative tokens above, over a different (always host-side) `Sequence` field.
         let use_pending_ff =
             crate::speculative::staging::pending_ff_batch_width(input_seqs).is_some();
+        {
+            let raw_pending_ff_lens: Vec<usize> = input_seqs
+                .iter()
+                .map(|seq| seq.active_pending_ff_tokens().len())
+                .collect();
+            tracing::debug!(
+                ?raw_pending_ff_lens,
+                use_pending_ff,
+                "ff_trace: inputs_processor use_pending_ff assigned"
+            );
+        }
         // An unresolved splice here would grow the decode window without a matching KV cache
         // advance, so fail loudly instead of building a mismatched window.
         if !use_pending_ff

@@ -1820,6 +1820,18 @@ impl Engine {
                         }
                         let pending_ff_width =
                             crate::speculative::staging::pending_ff_batch_width(&guards_mut);
+                        {
+                            let raw_pending_ff_lens: Vec<usize> = guards_mut
+                                .iter()
+                                .map(|seq| seq.active_pending_ff_tokens().len())
+                                .collect();
+                            tracing::debug!(
+                                is_prompt,
+                                ?raw_pending_ff_lens,
+                                ?pending_ff_width,
+                                "ff_trace: engine pending_ff_width assigned"
+                            );
+                        }
                         let staged_width =
                             crate::speculative::staging::staged_batch_width(&guards_mut);
                         let scheduler_visible_prompt_step =
