@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["ok", "error", "pending", "retrying"]
+    },
+    "message": {
+      "type": "string"
+    },
+    "retry_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 99
+    }
+  },
+  "required": ["status", "message", "retry_count"],
+  "additionalProperties": false
+}
