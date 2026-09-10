@@ -34,6 +34,7 @@ import argparse
 import contextlib
 import json
 import os
+import random
 import re
 import shlex
 import statistics
@@ -505,14 +506,72 @@ def metric_deltas(before: dict[str, float], after: dict[str, float]) -> dict[str
 
 
 @dataclass
+class PlannedRequest:
+    index: int
+    constrained: bool
+    schema_index: int | None
+    scheduled_offset_s: float
+
+
+@dataclass
 class ConcurrencyRequestResult:
     index: int
     constrained: bool
     ok: bool
     status: int | None
     latency_s: float
+    schema_index: int | None = None
+    scheduled_offset_s: float = 0.0
+    start_offset_s: float = 0.0
     finish_reason: str | None = None
     error: str | None = None
+
+
+def plan_concurrency_requests(
+    num_requests: int,
+    unconstrained_fraction: float,
+    schema_set: str,
+    num_schemas: int,
+    seed: int,
+    stagger_seconds: float,
+) -> list[PlannedRequest]:
+    """Decide, deterministically from `seed`, which slots go unconstrained and which schema each
+    constrained slot carries.
+
+    Slot choice is seeded rather than "first k are unconstrained" so the unconstrained requests are
+    not always the ones submitted first. Schemas are handed out round-robin over a seeded shuffle of
+    the fixture order, so a `differing` run gives every slot a distinct schema while `num_requests`
+    fits in the fixture set -- which is what plan 06 workload B needs.
+    """
+    if num_requests < 1:
+        raise ValueError(f"--num-requests must be >= 1, got {num_requests}")
+    if not 0.0 <= unconstrained_fraction <= 1.0:
+        raise ValueError(
+            f"--unconstrained-fraction must be in [0, 1], got {unconstrained_fraction}"
+        )
+    if stagger_seconds < 0.0:
+        raise ValueError(f"--stagger-seconds must be >= 0, got {stagger_seconds}")
+    if num_schemas < 1:
+        raise ValueError("need at least one schema fixture")
+
+    rng = random.Random(seed)
+    n_unconstrained = round(num_requests * unconstrained_fraction)
+    unconstrained_slots = set(rng.sample(range(num_requests), n_unconstrained))
+
+    order = list(range(num_schemas))
+    if schema_set == "differing":
+        rng.shuffle(order)
+
+    plan: list[PlannedRequest] = []
+    constrained_seen = 0
+    for i in range(num_requests):
+        constrained = i not in unconstrained_slots
+        schema_index = None
+        if constrained:
+            schema_index = 0 if schema_set == "identical" else order[constrained_seen % num_schemas]
+            constrained_seen += 1
+        plan.append(PlannedRequest(i, constrained, schema_index, i * stagger_seconds))
+    return plan
 
 
 def build_concurrency_request_body(
@@ -539,7 +598,13 @@ def build_concurrency_request_body(
     return body
 
 
-def fire_one(base_url: str, index: int, constrained: bool, body: dict[str, Any]) -> ConcurrencyRequestResult:
+def fire_one(
+    base_url: str, planned: PlannedRequest, body: dict[str, Any], wall_start: float
+) -> ConcurrencyRequestResult:
+    remaining = planned.scheduled_offset_s - (time.perf_counter() - wall_start)
+    if remaining > 0:
+        time.sleep(remaining)
+
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         f"{base_url}/v1/chat/completions",
@@ -548,16 +613,27 @@ def fire_one(base_url: str, index: int, constrained: bool, body: dict[str, Any])
         method="POST",
     )
     start = time.perf_counter()
+    common = dict(
+        index=planned.index,
+        constrained=planned.constrained,
+        schema_index=planned.schema_index,
+        scheduled_offset_s=planned.scheduled_offset_s,
+        start_offset_s=start - wall_start,
+    )
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         latency = time.perf_counter() - start
         finish_reason = payload.get("choices", [{}])[0].get("finish_reason")
-        return ConcurrencyRequestResult(index, constrained, True, resp.status, latency, finish_reason)
+        return ConcurrencyRequestResult(
+            ok=True, status=resp.status, latency_s=latency, finish_reason=finish_reason, **common
+        )
     except Exception as exc:  # noqa: BLE001 - reported in the JSON report, not raised
         latency = time.perf_counter() - start
         status = getattr(exc, "code", None)
-        return ConcurrencyRequestResult(index, constrained, False, status, latency, error=str(exc))
+        return ConcurrencyRequestResult(
+            ok=False, status=status, latency_s=latency, error=str(exc), **common
+        )
 
 
 def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
@@ -568,6 +644,14 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
     base_url = f"http://{args.server_host}:{args.server_port}"
     metric_prefixes = list(args.metric_prefix)
     schema_files = resolve_schema_files(args.schema_set, args.schema_files)
+    plan = plan_concurrency_requests(
+        args.num_requests,
+        args.unconstrained_fraction,
+        args.schema_set,
+        len(schema_files),
+        args.seed,
+        args.stagger_seconds,
+    )
 
     server_cmd = parse_server_cmd(args.server_cmd)
     print(f"--- launching server: {shlex.join(server_cmd)} ---", file=sys.stderr)
@@ -578,25 +662,24 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
         schemas = [json.loads(Path(p).read_text()) for p in schema_files]
 
         n = args.num_requests
-        n_unconstrained = round(n * args.unconstrained_fraction)
-        bodies: list[tuple[bool, dict[str, Any]]] = []
-        for i in range(n):
-            constrained = i >= n_unconstrained
-            schema = None
-            if constrained:
-                if args.schema_set == "identical":
-                    schema = schemas[0]
-                else:
-                    schema = schemas[i % len(schemas)]
-            bodies.append((constrained, build_concurrency_request_body(args.prompt, args.max_tokens, schema)))
+        bodies = [
+            build_concurrency_request_body(
+                args.prompt,
+                args.max_tokens,
+                None if planned.schema_index is None else schemas[planned.schema_index],
+                seed=args.seed,
+            )
+            for planned in plan
+        ]
+        n_unconstrained = sum(1 for planned in plan if not planned.constrained)
 
         metrics_before = scrape_metrics(base_url, metric_prefixes)
         wall_start = time.perf_counter()
         results: list[ConcurrencyRequestResult] = []
         with ThreadPoolExecutor(max_workers=n) as pool:
             futures = [
-                pool.submit(fire_one, base_url, i, constrained, body)
-                for i, (constrained, body) in enumerate(bodies)
+                pool.submit(fire_one, base_url, planned, body, wall_start)
+                for planned, body in zip(plan, bodies)
             ]
             for fut in as_completed(futures):
                 results.append(fut.result())
@@ -625,14 +708,24 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
         "base_url": base_url,
         "num_requests": n,
         "num_unconstrained": n_unconstrained,
+        "unconstrained_fraction": args.unconstrained_fraction,
         "schema_set": args.schema_set,
         "schema_files": schema_files,
+        "stagger_seconds": args.stagger_seconds,
+        "seed": args.seed,
+        "request_seed_sent": args.seed,
+        "prompt": args.prompt,
         "max_tokens": args.max_tokens,
+        "startup_timeout_seconds": args.startup_timeout_seconds,
         "wall_elapsed_s": wall_elapsed,
         "requests": [
             {
                 "index": r.index,
                 "constrained": r.constrained,
+                "schema_index": r.schema_index,
+                "schema_file": None if r.schema_index is None else schema_files[r.schema_index],
+                "scheduled_offset_s": r.scheduled_offset_s,
+                "start_offset_s": r.start_offset_s,
                 "ok": r.ok,
                 "status": r.status,
                 "latency_s": r.latency_s,
@@ -719,6 +812,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "the single equality fixture for --schema-set identical and to the "
                              "four differing-forced-span fixtures for --schema-set differing.")
     p_run.add_argument("--unconstrained-fraction", type=float, default=0.25)
+    p_run.add_argument("--stagger-seconds", type=float, default=0.0,
+                        help="concurrency mode only: delay request i by i * this, so requests sit "
+                             "at different grammar positions while still overlapping (plan 06 "
+                             "asks for at least one staggered variant). Keep it well under the "
+                             "per-request latency or the requests stop overlapping.")
     p_run.add_argument("--metric-prefix", nargs="*", default=list(DEFAULT_METRIC_PREFIXES),
                         metavar="PREFIX",
                         help="concurrency mode only: keep only /metrics samples whose name starts "
@@ -745,7 +843,11 @@ def main(argv: list[str] | None = None) -> None:
             parser.error("--server-cmd is required for --mode concurrency")
         try:
             parse_server_cmd(args.server_cmd)
-            resolve_schema_files(args.schema_set, args.schema_files)
+            files = resolve_schema_files(args.schema_set, args.schema_files)
+            plan_concurrency_requests(
+                args.num_requests, args.unconstrained_fraction, args.schema_set,
+                len(files), args.seed, args.stagger_seconds,
+            )
         except ValueError as exc:
             parser.error(str(exc))
 

@@ -9,11 +9,17 @@ Run with: python3 -m unittest test_ff_harness -v
 
 from __future__ import annotations
 
+import collections
+import concurrent.futures
 import contextlib
+import http.server
 import importlib.util
 import io
 import json
+import socket
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -240,6 +246,170 @@ class RequestBodyTest(unittest.TestCase):
     def test_seed_is_only_sent_when_given(self):
         self.assertEqual(ffh.build_concurrency_request_body("hi", 16, None, seed=7)["seed"], 7)
         self.assertNotIn("seed", ffh.build_concurrency_request_body("hi", 16, None))
+
+
+class ConcurrencyPlanTest(unittest.TestCase):
+    """F7: the schedule must be reproducible from --seed and must actually stagger."""
+
+    def plan(self, **kw):
+        params = dict(num_requests=8, unconstrained_fraction=0.25, schema_set="differing",
+                      num_schemas=4, seed=42, stagger_seconds=0.0)
+        params.update(kw)
+        return ffh.plan_concurrency_requests(**params)
+
+    def test_same_seed_gives_the_same_plan(self):
+        self.assertEqual(self.plan(), self.plan())
+
+    def test_a_different_seed_gives_a_different_plan(self):
+        seeds = {tuple((p.constrained, p.schema_index) for p in self.plan(seed=s))
+                 for s in range(12)}
+        self.assertGreater(len(seeds), 1)
+
+    def test_unconstrained_count_follows_the_fraction(self):
+        for frac, expected in ((0.0, 0), (0.25, 2), (0.5, 4), (1.0, 8)):
+            plan = self.plan(unconstrained_fraction=frac)
+            self.assertEqual(sum(1 for p in plan if not p.constrained), expected, frac)
+
+    def test_unconstrained_slots_are_not_always_the_first_ones(self):
+        # the pre-fix behaviour put every unconstrained request at the head of the batch
+        head_only = 0
+        for seed in range(20):
+            plan = self.plan(seed=seed, unconstrained_fraction=0.5)
+            idx = [p.index for p in plan if not p.constrained]
+            if idx == list(range(len(idx))):
+                head_only += 1
+        self.assertLess(head_only, 20)
+
+    def test_differing_gives_every_slot_a_distinct_schema_when_it_fits(self):
+        plan = self.plan(num_requests=4, unconstrained_fraction=0.0, num_schemas=4)
+        used = [p.schema_index for p in plan]
+        self.assertEqual(sorted(used), [0, 1, 2, 3])
+
+    def test_differing_round_robins_when_it_does_not_fit(self):
+        plan = self.plan(num_requests=8, unconstrained_fraction=0.0, num_schemas=4)
+        counts = collections.Counter(p.schema_index for p in plan)
+        self.assertEqual(sorted(counts.values()), [2, 2, 2, 2])
+
+    def test_identical_always_uses_the_first_schema(self):
+        plan = self.plan(schema_set="identical", num_schemas=1, unconstrained_fraction=0.0)
+        self.assertEqual({p.schema_index for p in plan}, {0})
+
+    def test_unconstrained_slots_carry_no_schema(self):
+        for p in self.plan(unconstrained_fraction=0.5):
+            self.assertEqual(p.schema_index is None, not p.constrained)
+
+    def test_stagger_offsets_are_monotonic_and_scaled(self):
+        plan = self.plan(num_requests=4, stagger_seconds=0.25)
+        self.assertEqual([p.scheduled_offset_s for p in plan], [0.0, 0.25, 0.5, 0.75])
+
+    def test_zero_stagger_means_a_synchronised_start(self):
+        self.assertEqual({p.scheduled_offset_s for p in self.plan(stagger_seconds=0.0)}, {0.0})
+
+    def test_invalid_parameters_are_rejected(self):
+        for kw in ({"num_requests": 0}, {"unconstrained_fraction": 1.5},
+                   {"unconstrained_fraction": -0.1}, {"stagger_seconds": -1.0},
+                   {"num_schemas": 0}):
+            with self.assertRaises(ValueError, msg=kw):
+                self.plan(**kw)
+
+    def test_cli_exposes_seed_and_stagger(self):
+        parser = ffh.build_parser()
+        args = parser.parse_args([
+            "run", "--mode", "concurrency", "--flag", "on", "--model-id", "x",
+            "--server-cmd", "srv", "--seed", "7", "--stagger-seconds", "0.5",
+        ])
+        self.assertEqual(args.seed, 7)
+        self.assertEqual(args.stagger_seconds, 0.5)
+
+
+class _StubHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal stand-in for the mistral.rs HTTP surface. No model, no inference."""
+
+    bodies: list = []
+
+    def log_message(self, *_args):
+        pass
+
+    def _send(self, code, payload, content_type="application/json"):
+        raw = payload.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._send(200, "{}")
+        elif self.path == "/metrics":
+            self._send(200, SAMPLE_METRICS_BODY, "text/plain")
+        else:
+            self._send(404, "{}")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).bodies.append(json.loads(self.rfile.read(length)))
+        time.sleep(0.25)  # long enough that staggered requests still overlap
+        self._send(200, json.dumps({"choices": [{"finish_reason": "stop"}]}))
+
+
+class StubServerTest(unittest.TestCase):
+    """Exercises fire_one / scrape_metrics against a real socket. Still no model, no mistralrs."""
+
+    def setUp(self):
+        _StubHandler.bodies = []
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base_url = "http://127.0.0.1:%d" % self.server.server_address[1]
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_health_wait_and_metric_scrape(self):
+        ffh.wait_for_health(self.base_url, 5.0)
+        metrics = ffh.scrape_metrics(self.base_url, ffh.DEFAULT_METRIC_PREFIXES)
+        self.assertEqual(metrics["mistralrs_decode_tokens_processed_total"], 9001.0)
+
+    def test_stagger_delays_starts_but_requests_still_overlap(self):
+        plan = ffh.plan_concurrency_requests(4, 0.0, "identical", 1, 42, stagger_seconds=0.05)
+        body = ffh.build_concurrency_request_body("hi", 4, None, seed=42)
+        wall_start = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(
+                lambda pr: ffh.fire_one(self.base_url, pr, body, wall_start), plan))
+        wall_elapsed = time.perf_counter() - wall_start
+
+        self.assertTrue(all(r.ok for r in results), [r.error for r in results])
+        starts = [r.start_offset_s for r in results]
+        self.assertEqual(starts, sorted(starts))
+        self.assertGreater(starts[-1] - starts[0], 0.1)   # the stagger really happened
+        # overlapping: serialising 4 x 0.25s requests would take >= 1.0s
+        self.assertLess(wall_elapsed, 0.9)
+
+    def test_the_server_receives_the_tagged_grammar_and_the_seed(self):
+        schema = json.loads(ffh.DEFAULT_SCHEMA_FIXTURE.read_text())
+        plan = ffh.plan_concurrency_requests(1, 0.0, "identical", 1, 42, 0.0)
+        body = ffh.build_concurrency_request_body("hi", 4, schema, seed=99)
+        result = ffh.fire_one(self.base_url, plan[0], body, time.perf_counter())
+        self.assertTrue(result.ok)
+        received = _StubHandler.bodies[0]
+        self.assertEqual(received["grammar"]["type"], "json_schema")
+        self.assertEqual(received["grammar"]["value"], schema)
+        self.assertEqual(received["seed"], 99)
+
+    def test_a_failed_request_is_recorded_not_raised(self):
+        plan = ffh.plan_concurrency_requests(1, 0.0, "identical", 1, 42, 0.0)
+        dead = "http://127.0.0.1:%d" % _free_port()
+        result = ffh.fire_one(dead, plan[0], {"model": "default"}, time.perf_counter())
+        self.assertFalse(result.ok)
+        self.assertIsNotNone(result.error)
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 if __name__ == "__main__":
