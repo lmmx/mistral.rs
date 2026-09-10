@@ -99,6 +99,12 @@ default `MakeWriter`, and `tracing-subscriber` 0.3.22's source is not vendored i
 (no `cargo`, no registry, no `vendor/`) to confirm which fd that is. Capturing both makes the
 question moot rather than guessed.
 
+Matched lines are kept verbatim under `capture.lines`, each tagged with the stream it came from,
+and aggregated under `capture.aggregate`: the emission-ordered expert sequence per `layer=L,row=R`
+plus its collapsed counts, which is plan 05's "keyed by layer and batch row". `compare` diffs that
+aggregate alongside the token ids, naming the first forward at which the two runs chose different
+experts, and reports which row of plan 03's outcome table the pair lands on.
+
 Two numbers in the report make a null result readable: `capture.lines_seen` (per stream) and
 `capture.total_lines_seen`, alongside `capture.num_matched_lines`. Zero matches out of zero lines
 seen means the capture never saw output at all; zero matches out of a few thousand lines means the
@@ -125,8 +131,10 @@ for today's tree.
 
 ### `arms`
 
-Same shape as `routing-log` (both streams, debug logging on, same `lines_seen` accounting), default
-pattern `\bARM\b`, for the nine recurrent-site arm messages
+Same shape as `routing-log` (both streams, debug logging on, same `lines_seen` accounting, raw lines
+kept), except the aggregate is plan 05's count per site per arm -- `capture.aggregate.counts[site][arm]`
+-- and `compare` reports which site/arm counts moved between the two runs. Default pattern
+`\bARM\b`, for the nine recurrent-site arm messages
 `reports/04-recurrent-site-audit.md` describes. Same caveat: that report's Deliverable 2 (adding the
 `tracing::debug!` calls) was not run either, so this mode also captures nothing at this tip. Built
 as the same generic stderr-capture mechanism as `routing-log` rather than a second implementation,
@@ -208,7 +216,7 @@ All of the following ran in this session, with the exact commands used:
   correctly errors `--server-cmd is required for --mode concurrency` via the `main()` guard, which
   now also validates the command splits, the schema set can differ, and the request plan is
   constructible, all before anything is launched.
-- `python3 -m unittest test_ff_harness` -- 53 tests, all passing, stdlib only (no pytest in the
+- `python3 -m unittest test_ff_harness` -- 94 tests, all passing, stdlib only (no pytest in the
   container). They cover: `parse_server_cmd` on a flagged command line and on quoted arguments;
   `parse_metrics_body` against a synthetic Prometheus body carrying the fast-forward counters, the
   token counters, the preemption and KV gauges, a labelled counter, a comment line, junk, and a
@@ -223,6 +231,22 @@ All of the following ran in this session, with the exact commands used:
   them on the normal and exception paths; `scan_captured_streams` distinguishing zero-of-zero from
   zero-of-many; `configure_capture_logging` across the capture and non-capture modes, an explicit
   `--rust-log`, an operator-set `MISTRALRS_DEBUG`, and the already-imported hazard flag.
+- For F5: `parse_tracing_fields` on quoted, bare, numeric and escaped values, on a field-less line,
+  and on the shape `sampling.rs:1636` actually emits; arm aggregation per site per arm across all
+  nine site identifiers, with wrong field names surfacing as unparsed rather than as an empty
+  result; routing aggregation keyed by layer and row with emission order preserved; and `compare`
+  over each row of plan 03's outcome table -- identical/identical, identical/differ (asserting the
+  first divergent forward and both tails), differ/either -- plus keys seen in only one run, arm
+  count deltas, a report with no capture at all, a capture diff surviving missing token ids, raw
+  lines surviving alongside the aggregate, and the markdown summary naming the divergence.
+- For F8: `build_anymoe_config` over the `FineTuned` string and object forms, `LoraAdapter` with its
+  three fields, forgiving variant spellings, and rejection of an unknown variant, stray or missing
+  variant fields, a missing required key, a mistyped optional key, and non-object inputs -- driven
+  through a stub module shaped like the pyo3 classes, plus `AnyMoeApiSurfaceTest`, which parses
+  `mistralrs/__init__.pyi` out of the wheel committed on this branch and asserts the harness's
+  required/optional key lists and `LoraAdapter` field names still match the shipped signature. That
+  last test was checked against two deliberate perturbations of the key lists and fails on both, so
+  it is not passing vacuously.
 - Four of those tests run against a stdlib `http.server` stub on a loopback port -- still no model
   and no `mistralrs` extension -- confirming `wait_for_health`, `scrape_metrics` over a real socket,
   that a staggered burst starts in order and still overlaps (four 0.25 s requests finishing in
@@ -258,8 +282,9 @@ toolchain, a model, and (for `routing-log`/`arms`) the missing `mistralrs-core` 
 
 ## Audit follow-up
 
-A later session audited this harness against plan 05 and returned `PASS WITH ISSUES`. Five findings
-were fixed on `ff-demo-artifacts`; no Rust source was touched and no plan 06 work was done.
+A later session audited this harness against plan 05 and returned `PASS WITH ISSUES`. Seven
+findings were fixed on `ff-demo-artifacts` across two follow-up rounds; no Rust source was touched
+and no plan 06 work was done.
 
 | Finding | Problem | Fix |
 |---|---|---|
@@ -268,16 +293,38 @@ were fixed on `ff-demo-artifacts`; no Rust source was touched and no plan 06 wor
 | F6 | `--schema-set differing` silently round-robined one fixture, producing workload A while the report said workload B | a four-fixture default set, and a hard error on any explicit set with fewer than two distinct files |
 | F7 | `--seed` never reached concurrency mode, unconstrained requests were always the first slots, and none of the schedule was recorded | seeded schedule, `--stagger-seconds`, and the full parameter set in the report |
 | F2 + F3 | capture watched fd 2 only and left logging at `info`, so a run that never had a chance to see a `tracing::debug!` line looked identical to a real negative | capture both fds, set `MISTRALRS_DEBUG=1` for the capture modes before the import that fixes the filter, record the logging config and the lines-seen totals |
+| F5 | `routing-log`/`arms` kept only a flat list of matched lines and `compare` diffed token ids alone, so plan 05's "count per site per arm" and "diff routing as well as tokens" were unimplemented | parse the trailing tracing `key=value` fields, aggregate per site per arm and per layer/row, diff both in `compare`, keep the raw lines |
+| F8 | `AnyMoeConfig(**json)` could never construct the `expert_type` pyo3 complex enum, so `--anymoe-config-json` raised `TypeError` for plan 03 Part B's only use of it | name the variant in JSON and construct `AnyMoeExpertType.FineTuned()` / `.LoraAdapter(...)`, with the key lists checked against the shipped stub |
 
 One further defect was fixed because F6 and F7 are meaningless without it: the concurrency request
 body sent the Python API's `grammar_type` + string `grammar`, which the HTTP route cannot
 deserialise, so every constrained request would have been rejected before reaching the model.
 
-Deliberately **not** done, per the audit's own ranking and the follow-up's scope: aggregating the
-`arms` capture per site per arm and diffing routing in the driver (F5), mapping `--anymoe-config-json`
-onto the `AnyMoeExpertType` pyclass it actually needs (F8), and the reproducibility extras -- build
-identity, commit, argv, schema hash -- plus the smaller robustness items (F9). F5 and F8 matter to
-plans 03 and 04 rather than 06; both remain open.
+Deliberately **not** done, per the audit's own ranking and the follow-up's scope: the
+reproducibility extras -- build identity, commit, argv, schema hash -- and the smaller robustness
+items (F9). Those remain open.
+
+### What F5 does and does not claim
+
+The aggregation consumes a rendering that provably exists on this branch -- `tracing_subscriber::fmt`
+writes structured fields as trailing `key=value`, as at `sampling.rs:1636`
+(`tracing::debug!(splice_len = splice.len(), ...)`) and `sequence.rs:1269` (`error = %e`). What does
+*not* exist yet is anything to parse: plan 03's routing line and plan 04's nine arm messages are
+both still unwritten. The field **names** are therefore CLI options (`--arm-site-field`,
+`--arm-field`, `--routing-layer-field`, `--routing-row-field`, `--routing-expert-field`) with
+documented defaults, not assumptions baked into the parser, and matched-but-unparsed lines are
+counted and sampled in the report so a name mismatch shows up instead of reading as a clean zero.
+
+For the same reason `compare` refuses to call two empty captures "equal": at this tip that is
+"nothing to diff", and reporting it as agreement would manufacture exactly the plan 03 table row
+("tokens identical, expert indices identical") that the plan says is the only one supporting a
+re-enable. When there *are* observations, `compare` names the row reached and exits nonzero on
+routing or arm divergence as well as on token divergence.
+
+One more thing worth recording for whoever writes plan 03's instrumentation: `MoeMlp::forward`
+(`amoe/mod.rs:258-284`) has no layer index in scope at all, so "keyed by layer" needs a layer id
+threaded into `MoeMlp` before a log line can carry one. The harness will key on whatever field the
+line does carry; it cannot invent the layer.
 
 ## Environment note
 
