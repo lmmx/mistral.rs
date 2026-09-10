@@ -936,6 +936,8 @@ class ConcurrencyRequestResult:
     start_offset_s: float = 0.0
     finish_reason: str | None = None
     error: str | None = None
+    content: str | None = None
+    usage: dict[str, Any] | None = None
 
 
 def plan_concurrency_requests(
@@ -1035,9 +1037,13 @@ def fire_one(
         with urllib.request.urlopen(req, timeout=300) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         latency = time.perf_counter() - start
-        finish_reason = payload.get("choices", [{}])[0].get("finish_reason")
+        choice = payload.get("choices", [{}])[0]
+        finish_reason = choice.get("finish_reason")
+        content = choice.get("message", {}).get("content")
+        usage = payload.get("usage")
         return ConcurrencyRequestResult(
-            ok=True, status=resp.status, latency_s=latency, finish_reason=finish_reason, **common
+            ok=True, status=resp.status, latency_s=latency, finish_reason=finish_reason,
+            content=content, usage=usage, **common
         )
     except Exception as exc:  # noqa: BLE001 - reported in the JSON report, not raised
         latency = time.perf_counter() - start
@@ -1142,6 +1148,8 @@ def run_concurrency(args: argparse.Namespace) -> dict[str, Any]:
                 "latency_s": r.latency_s,
                 "finish_reason": r.finish_reason,
                 "error": r.error,
+                "content": r.content,
+                "usage": r.usage,
             }
             for r in results
         ],
