@@ -14,13 +14,16 @@ Modes:
   equality      One fixed request under a partially-forcing JSON schema grammar. Records the full
                 token id list, decoded text, finish reason, and per-token timings.
   routing-log   `equality` plus best-effort capture of AnyMoE expert-routing lines from the
-                process's own stderr (tracing output), if the running tip logs any. At the tip this
+                process's own stdout and stderr (tracing output), if the running tip logs any.
+                Debug-level logging is enabled for this mode and the effective logging config plus
+                the total number of captured lines go into the report, so "captured nothing at all"
+                is distinguishable from "captured plenty, matched none". At the tip this
                 harness was built against, no such log line exists yet (see
                 plans/ff-round-two/reports/03-anymoe-divergence.md); this mode is the capture
                 mechanism a future instrumentation change can feed, not a claim that it finds
                 anything today.
   arms          `equality` plus best-effort capture of the nine recurrent-site arm messages from
-                stderr, same caveat as routing-log (see reports/04-recurrent-site-audit.md).
+                the same streams, same caveat as routing-log (see reports/04-recurrent-site-audit.md).
   concurrency   Launches an HTTP server subprocess, fires N concurrent chat completions (a mix of
                 grammar-constrained and unconstrained), and scrapes /metrics before and after.
                 Requires a paged-attention-capable (CUDA or Metal) server build.
@@ -67,10 +70,19 @@ DEFAULT_PROMPT = (
     "Report the status of the last deployment. Respond with only the requested JSON object."
 )
 EQUALITY_MODES = ("equality", "routing-log", "arms")
+CAPTURE_MODES = ("routing-log", "arms")
 ALL_MODES = EQUALITY_MODES + ("concurrency",)
 
 DEFAULT_ROUTING_LOG_PATTERN = r"EXPERT_IDX"
 DEFAULT_ARMS_PATTERN = r"\bARM\b"
+
+DEBUG_ENV_VAR = "MISTRALRS_DEBUG"
+RUST_LOG_ENV_VAR = "RUST_LOG"
+# `initialize_mistralrs_logging` builds its filter from RUST_LOG if set, else from MISTRALRS_DEBUG:
+# `warn` plus `mistralrs=debug` when it contains '1', `mistralrs=info` otherwise
+# (mistralrs-core/src/utils/debug.rs:29-62). Plan 03's routing line and plan 04's nine arm messages
+# are both `tracing::debug!`, so at the default info level they would never be emitted at all.
+DEBUG_ENV_ENABLED_VALUE = "1"
 
 # Plan 06 reads dimensions 1-2 off `mistralrs_grammar_ff_*` but dimension 5 (tokens/s, forward
 # passes) off `mistralrs_decode_tokens_processed_total` / `mistralrs_prefill_tokens_processed_total`
@@ -157,28 +169,79 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------------------
 
 
-@contextlib.contextmanager
-def capture_stderr():
-    """Redirect OS-level fd 2 to a temp file for the duration of the block and yield its path.
+def configure_capture_logging(mode: str, rust_log: str | None) -> dict[str, Any]:
+    """Set the logging env the capture modes need, and describe what was set.
 
-    Rust's tracing subscriber writes to the process's real stderr fd, not Python's `sys.stderr`
-    object, so capturing this way (rather than `contextlib.redirect_stderr`) is required to see
-    anything the mistralrs-core tracing calls emit.
+    Must run before the first `import mistralrs`: the pyo3 module initialiser calls
+    `initialize_logging()` (mistralrs-pyo3/src/lib.rs:3223) and the filter is fixed in a `OnceLock`,
+    so setting these afterwards has no effect. `set_before_mistralrs_import` records whether that
+    ordering actually held rather than hiding it.
     """
-    tmp = tempfile.NamedTemporaryFile(prefix="ff_harness_stderr_", suffix=".log", delete=False)
-    tmp_path = Path(tmp.name)
-    tmp.close()
-    saved_fd = os.dup(2)
-    target_fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-    sys.stderr.flush()
-    os.dup2(target_fd, 2)
-    os.close(target_fd)
+    already_imported = "mistralrs" in sys.modules
+    if rust_log is not None:
+        os.environ[RUST_LOG_ENV_VAR] = rust_log
+    elif mode in CAPTURE_MODES:
+        os.environ.setdefault(DEBUG_ENV_VAR, DEBUG_ENV_ENABLED_VALUE)
+    return {
+        "capture_modes_enable_debug": mode in CAPTURE_MODES,
+        RUST_LOG_ENV_VAR: os.environ.get(RUST_LOG_ENV_VAR, "<unset>"),
+        DEBUG_ENV_VAR: os.environ.get(DEBUG_ENV_VAR, "<unset>"),
+        "set_before_mistralrs_import": not already_imported,
+    }
+
+
+@contextlib.contextmanager
+def capture_std_streams():
+    """Redirect OS-level fd 1 and fd 2 to temp files for the block, yielding both paths.
+
+    Rust's tracing subscriber writes to a real fd, not Python's `sys.stdout`/`sys.stderr` objects,
+    so `contextlib.redirect_stderr` would see nothing. Which fd it writes to depends on
+    `tracing_subscriber::fmt()`'s default `MakeWriter`: `initialize_logging` never calls
+    `.with_writer(...)` (mistralrs-core/src/utils/debug.rs:47) and the crate source is not vendored
+    in this checkout, so rather than betting on stdout or stderr this captures both and reports them
+    separately.
+    """
+    saved = {}
+    paths = {}
     try:
-        yield tmp_path
+        for fd, name in ((1, "stdout"), (2, "stderr")):
+            tmp = tempfile.NamedTemporaryFile(
+                prefix=f"ff_harness_{name}_", suffix=".log", delete=False
+            )
+            paths[name] = Path(tmp.name)
+            tmp.close()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            saved[fd] = os.dup(fd)
+            target_fd = os.open(paths[name], os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+            os.dup2(target_fd, fd)
+            os.close(target_fd)
+        yield paths
     finally:
+        sys.stdout.flush()
         sys.stderr.flush()
-        os.dup2(saved_fd, 2)
-        os.close(saved_fd)
+        for fd, original in saved.items():
+            os.dup2(original, fd)
+            os.close(original)
+
+
+def scan_captured_streams(paths: dict[str, Path], pattern: re.Pattern) -> dict[str, Any]:
+    """Grep the captured streams, keeping the totals that make a zero result interpretable."""
+    matched: list[dict[str, str]] = []
+    lines_seen = {}
+    for name, path in paths.items():
+        raw = path.read_text(errors="replace")
+        lines = raw.splitlines()
+        lines_seen[name] = len(lines)
+        matched += [{"stream": name, "line": line} for line in lines if pattern.search(line)]
+        path.unlink(missing_ok=True)
+    return {
+        "pattern": pattern.pattern,
+        "lines_seen": lines_seen,
+        "total_lines_seen": sum(lines_seen.values()),
+        "num_matched_lines": len(matched),
+        "lines": matched,
+    }
 
 
 def build_plain_runner(args: argparse.Namespace):
@@ -232,10 +295,14 @@ def run_equality_like(args: argparse.Namespace) -> dict[str, Any]:
     if args.flag == "unset":
         os.environ.pop(FF_ENV_VAR, None)
 
+    # before build_plain_runner: that is where `import mistralrs` -- and with it the one-shot
+    # tracing filter setup -- actually happens.
+    logging_config = configure_capture_logging(args.mode, args.rust_log)
+
     runner = build_plain_runner(args)
     request = build_chat_request(args)
 
-    capture_needed = args.mode in ("routing-log", "arms")
+    capture_needed = args.mode in CAPTURE_MODES
     pattern = re.compile(
         args.capture_pattern
         or (DEFAULT_ROUTING_LOG_PATTERN if args.mode == "routing-log" else DEFAULT_ARMS_PATTERN)
@@ -246,8 +313,8 @@ def run_equality_like(args: argparse.Namespace) -> dict[str, Any]:
     start = time.perf_counter()
     last_t = start
 
-    stderr_ctx = capture_stderr() if capture_needed else contextlib.nullcontext(None)
-    with stderr_ctx as stderr_path:
+    capture_ctx = capture_std_streams() if capture_needed else contextlib.nullcontext(None)
+    with capture_ctx as capture_paths:
         for chunk in runner.send_chat_completion_request(request):
             now = time.perf_counter()
             choice = chunk.choices[0]
@@ -271,11 +338,9 @@ def run_equality_like(args: argparse.Namespace) -> dict[str, Any]:
                 )
             last_t = now
 
-    captured_lines: list[str] = []
-    if capture_needed and stderr_path is not None:
-        raw = stderr_path.read_text(errors="replace")
-        captured_lines = [line for line in raw.splitlines() if pattern.search(line)]
-        stderr_path.unlink(missing_ok=True)
+    capture: dict[str, Any] | None = None
+    if capture_needed and capture_paths is not None:
+        capture = scan_captured_streams(capture_paths, pattern)
 
     content = "".join(s["delta"] for s in steps)
     token_ids = [s["token_id"] for s in steps]
@@ -286,6 +351,7 @@ def run_equality_like(args: argparse.Namespace) -> dict[str, Any]:
         "mode": args.mode,
         "flag_requested": args.flag,
         "flag_env_value": os.environ.get(FF_ENV_VAR, "<unset>"),
+        "logging": logging_config,
         "timestamp_utc": utc_stamp(),
         "model_id": args.model_id,
         "arch": args.arch,
@@ -304,12 +370,8 @@ def run_equality_like(args: argparse.Namespace) -> dict[str, Any]:
         "steps": steps,
         "total_elapsed_s": last_t - start,
     }
-    if capture_needed:
-        report["capture"] = {
-            "pattern": pattern.pattern,
-            "num_matched_lines": len(captured_lines),
-            "lines": captured_lines,
-        }
+    if capture is not None:
+        report["capture"] = capture
     return report
 
 
@@ -342,6 +404,8 @@ def run_child(args: argparse.Namespace, flag: str) -> Path:
         cmd += ["--anymoe-config-json", args.anymoe_config_json]
     if args.capture_pattern:
         cmd += ["--capture-pattern", args.capture_pattern]
+    if args.rust_log:
+        cmd += ["--rust-log", args.rust_log]
     if args.label:
         cmd += ["--label", args.label]
 
@@ -769,6 +833,10 @@ def add_common_request_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--label", default=None)
     p.add_argument("--anymoe-config-json", default=None,
                     help="routing-log mode only: JSON file with AnyMoeConfig kwargs")
+    p.add_argument("--rust-log", default=None,
+                    help="value for RUST_LOG in this run. Overrides the default, which leaves "
+                         "logging alone for --mode equality and sets MISTRALRS_DEBUG=1 for the "
+                         "routing-log/arms capture modes (their instrumentation is debug level).")
     p.add_argument("--capture-pattern", default=None,
                     help="routing-log/arms mode only: regex over captured stderr lines "
                          "(default depends on mode)")

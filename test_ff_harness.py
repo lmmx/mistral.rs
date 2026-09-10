@@ -16,10 +16,13 @@ import http.server
 import importlib.util
 import io
 import json
+import os
+import re
 import socket
 import sys
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -404,6 +407,115 @@ class StubServerTest(unittest.TestCase):
         result = ffh.fire_one(dead, plan[0], {"model": "default"}, time.perf_counter())
         self.assertFalse(result.ok)
         self.assertIsNotNone(result.error)
+
+
+class CaptureTest(unittest.TestCase):
+    """F2: capture both real fds, since which one tracing writes to is not pinned down here."""
+
+    def test_both_fds_are_captured(self):
+        with ffh.capture_std_streams() as paths:
+            os.write(1, b"line on stdout\n")
+            os.write(2, b"line on stderr\n")
+        self.assertEqual(paths["stdout"].read_text(), "line on stdout\n")
+        self.assertEqual(paths["stderr"].read_text(), "line on stderr\n")
+        for path in paths.values():
+            path.unlink(missing_ok=True)
+
+    def test_fds_are_restored_afterwards(self):
+        before = (os.fstat(1).st_ino, os.fstat(2).st_ino)
+        with ffh.capture_std_streams() as paths:
+            pass
+        for path in paths.values():
+            path.unlink(missing_ok=True)
+        self.assertEqual((os.fstat(1).st_ino, os.fstat(2).st_ino), before)
+
+    def test_fds_are_restored_after_an_exception(self):
+        before = (os.fstat(1).st_ino, os.fstat(2).st_ino)
+        with self.assertRaises(RuntimeError):
+            with ffh.capture_std_streams():
+                raise RuntimeError("boom")
+        self.assertEqual((os.fstat(1).st_ino, os.fstat(2).st_ino), before)
+
+    def _scan(self, stdout_text, stderr_text, pattern):
+        with ffh.capture_std_streams() as paths:
+            os.write(1, stdout_text.encode())
+            os.write(2, stderr_text.encode())
+        return ffh.scan_captured_streams(paths, re.compile(pattern))
+
+    def test_matches_are_tagged_with_their_stream(self):
+        got = self._scan("noise\nEXPERT_IDX layer=0 row=0\n", "EXPERT_IDX layer=1 row=0\n",
+                         "EXPERT_IDX")
+        self.assertEqual(got["num_matched_lines"], 2)
+        self.assertEqual({m["stream"] for m in got["lines"]}, {"stdout", "stderr"})
+
+    def test_silence_is_distinguishable_from_no_match(self):
+        """F3: the whole point -- 0 matched with 0 seen is a broken run, 0 of many is a real result."""
+        silent = self._scan("", "", "EXPERT_IDX")
+        self.assertEqual(silent["num_matched_lines"], 0)
+        self.assertEqual(silent["total_lines_seen"], 0)
+
+        noisy = self._scan("some log\nmore log\n", "warn: whatever\n", "EXPERT_IDX")
+        self.assertEqual(noisy["num_matched_lines"], 0)
+        self.assertEqual(noisy["total_lines_seen"], 3)
+        self.assertEqual(noisy["lines_seen"], {"stdout": 2, "stderr": 1})
+
+
+class LoggingConfigTest(unittest.TestCase):
+    """F3: debug-level logging must be on for the capture modes, and recorded either way."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in (ffh.DEBUG_ENV_VAR, ffh.RUST_LOG_ENV_VAR)}
+        for key in self._saved:
+            os.environ.pop(key, None)
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_capture_modes_turn_on_debug_logging(self):
+        for mode in ffh.CAPTURE_MODES:
+            os.environ.pop(ffh.DEBUG_ENV_VAR, None)
+            config = ffh.configure_capture_logging(mode, None)
+            self.assertEqual(os.environ[ffh.DEBUG_ENV_VAR], "1", mode)
+            self.assertTrue(config["capture_modes_enable_debug"], mode)
+
+    def test_plain_equality_does_not_touch_logging(self):
+        config = ffh.configure_capture_logging("equality", None)
+        self.assertNotIn(ffh.DEBUG_ENV_VAR, os.environ)
+        self.assertEqual(config[ffh.DEBUG_ENV_VAR], "<unset>")
+        self.assertFalse(config["capture_modes_enable_debug"])
+
+    def test_explicit_rust_log_wins(self):
+        config = ffh.configure_capture_logging("arms", "mistralrs=trace")
+        self.assertEqual(os.environ[ffh.RUST_LOG_ENV_VAR], "mistralrs=trace")
+        self.assertEqual(config[ffh.RUST_LOG_ENV_VAR], "mistralrs=trace")
+
+    def test_an_operator_supplied_debug_value_is_not_clobbered(self):
+        os.environ[ffh.DEBUG_ENV_VAR] = "0"
+        config = ffh.configure_capture_logging("arms", None)
+        self.assertEqual(config[ffh.DEBUG_ENV_VAR], "0")
+
+    def test_config_flags_a_late_setup(self):
+        config = ffh.configure_capture_logging("arms", None)
+        self.assertTrue(config["set_before_mistralrs_import"])
+        sys.modules["mistralrs"] = types.ModuleType("mistralrs")
+        try:
+            late = ffh.configure_capture_logging("arms", None)
+            self.assertFalse(late["set_before_mistralrs_import"])
+        finally:
+            del sys.modules["mistralrs"]
+
+    def test_cli_exposes_rust_log_on_both_subcommands(self):
+        parser = ffh.build_parser()
+        run = parser.parse_args(["run", "--mode", "arms", "--flag", "on", "--model-id", "x",
+                                 "--rust-log", "mistralrs=debug"])
+        cmp_ = parser.parse_args(["compare", "--mode", "arms", "--model-id", "x",
+                                  "--rust-log", "mistralrs=debug"])
+        self.assertEqual(run.rust_log, "mistralrs=debug")
+        self.assertEqual(cmp_.rust_log, "mistralrs=debug")
 
 
 def _free_port() -> int:
