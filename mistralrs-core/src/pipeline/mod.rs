@@ -1127,6 +1127,12 @@ impl LogitsSelection {
             .iter()
             .all(|span| *span == (first_start, first_len))
         {
+            tracing::debug!(
+                start = first_start,
+                len = first_len,
+                seq_len,
+                "ff_trace: LogitsSelection::Decode selected"
+            );
             return Ok(Self::Decode {
                 start: first_start,
                 len: first_len,

@@ -1629,6 +1629,15 @@ pub mod text_models_inputs_processor {
                 (0, query_len)
             });
             position_ids.push(effective_context_len);
+            if narrow_for_ff {
+                tracing::debug!(
+                    query_len,
+                    effective_context_len,
+                    window_tokens = ?ctxt,
+                    logits_span = ?context_lens.last(),
+                    "ff_trace: widened decode window built"
+                );
+            }
 
             if flash_attn {
                 seqlens_q.push(query_len as u32);
@@ -1697,6 +1706,23 @@ pub mod text_models_inputs_processor {
                         full_context_len
                     };
                     paged_attn_context_lens.push(paged_attn_context_len);
+                }
+
+                if narrow_for_ff {
+                    tracing::debug!(
+                        block_start,
+                        write_slots = ?slot_mappings.last(),
+                        "ff_trace: widened-step KV write slots"
+                    );
+                }
+                if block_start > 0 {
+                    let check_pos = block_start - 1;
+                    if let Some(&block_number) = table.get(check_pos / paged_attn_metadata.block_size)
+                    {
+                        let check_slot = block_number * paged_attn_metadata.block_size
+                            + check_pos % paged_attn_metadata.block_size;
+                        tracing::debug!(check_pos, check_slot, "ff_trace: predecessor slot resolved");
+                    }
                 }
             }
         }

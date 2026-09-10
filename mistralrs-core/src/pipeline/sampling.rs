@@ -1640,7 +1640,7 @@ pub async fn sample_sequence(
                         ff_metrics::classify_attempt(true, true, matcher_error, splice.len());
                     ff_attempt = Some(outcome);
                     if matches!(outcome, ff_metrics::FfAttempt::Staged) {
-                        tracing::debug!(splice_len = splice.len(), "fast-forward splice computed");
+                        tracing::debug!(splice_tokens = ?splice, "ff_trace: splice staged");
                         metrics::counter!("mistralrs_grammar_ff_splices_staged_total").increment(1);
                         seq.set_pending_ff_tokens(splice);
                     } else if matcher_error {
@@ -1682,6 +1682,12 @@ pub async fn sample_sequence(
             }
         }
     }
+
+    tracing::debug!(
+        logical_position = seq.get_toks().len(),
+        sampled_token = second_logprobs_response.token,
+        "ff_trace: sample_sequence result"
+    );
 
     Ok(second_logprobs_response)
 }
