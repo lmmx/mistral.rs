@@ -1727,6 +1727,59 @@ impl Qwen3_5TextModel {
         Ok(flushed)
     }
 
+    /// Cheap deterministic reduction over pooled GDN state for the active slots, logged at DEBUG.
+    /// Diagnostic only: localizes whether persistent GDN state diverges at the widened/ordinary
+    /// forward boundary. Guarded by `tracing::enabled!` since `to_scalar` forces a CUDA sync.
+    fn ff_trace_gdn_state_checksum(
+        &self,
+        cache: &HybridCache,
+        slots: &[u32],
+        boundary: &str,
+        query_len: usize,
+    ) {
+        if slots.is_empty() || !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        for (layer_idx, layer_type) in self.layer_types.iter().enumerate() {
+            if *layer_type != LayerType::LinearAttention {
+                continue;
+            }
+            let Some(HybridLayerCache::Recurrent(pool)) = cache.get(layer_idx) else {
+                continue;
+            };
+            let result = (|| -> Result<(f64, f64, f64, f64)> {
+                let idx = Tensor::from_vec(slots.to_vec(), (slots.len(),), pool.device())?;
+                let conv = pool.gather_conv_state(&idx)?.to_dtype(DType::F32)?;
+                let rec = pool.gather_recurrent_state(&idx)?.to_dtype(DType::F32)?;
+                let conv_sum = conv.sum_all()?.to_scalar::<f32>()? as f64;
+                let conv_sumsq = conv.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+                let rec_sum = rec.sum_all()?.to_scalar::<f32>()? as f64;
+                let rec_sumsq = rec.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
+                Ok((conv_sum, conv_sumsq, rec_sum, rec_sumsq))
+            })();
+            match result {
+                Ok((conv_sum, conv_sumsq, rec_sum, rec_sumsq)) => tracing::debug!(
+                    boundary,
+                    query_len,
+                    layer_idx,
+                    ?slots,
+                    conv_sum,
+                    conv_sumsq,
+                    rec_sum,
+                    rec_sumsq,
+                    "ff_trace: gdn_state_checksum"
+                ),
+                Err(err) => tracing::debug!(
+                    boundary,
+                    query_len,
+                    layer_idx,
+                    ?err,
+                    "ff_trace: gdn_state_checksum failed"
+                ),
+            }
+        }
+    }
+
     pub(super) fn flush_current_recurrent_state(&self) -> Result<()> {
         let cache = self.cache.hybrid();
         let has_slots = cache
@@ -2298,6 +2351,22 @@ impl Qwen3_5TextModel {
         let batch_size = xs.dim(0)?;
         let query_len = xs.dim(1)?;
         let recurrent_metadata = ctx.recurrent_metadata().cloned();
+        let ff_trace_active_slots: Vec<u32> = hybrid_cache
+            .state_indices_host()
+            .map(<[u32]>::to_vec)
+            .or_else(|| {
+                recurrent_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.state_indices_host())
+                    .map(<[u32]>::to_vec)
+            })
+            .unwrap_or_default();
+        self.ff_trace_gdn_state_checksum(
+            &hybrid_cache,
+            &ff_trace_active_slots,
+            "forward_entry",
+            query_len,
+        );
         let has_linear_attention = self
             .layer_types
             .iter()
@@ -2646,6 +2715,14 @@ impl Qwen3_5TextModel {
             }
             ctx.lm_head(&*self.lm_head, &xs)
         })();
+        if forward_result.is_ok() {
+            self.ff_trace_gdn_state_checksum(
+                &hybrid_cache,
+                &ff_trace_active_slots,
+                "forward_exit",
+                query_len,
+            );
+        }
         forward_result
     }
 
