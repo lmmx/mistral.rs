@@ -13,7 +13,7 @@ const QH_TRITS_PER_BYTE: usize = 4;
 const QS_STAGES: [usize; 3] = [32, 16, 8];
 const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
 
-#[inline]
+#[inline(always)]
 pub(super) const fn trit(byte: u8, n: usize) -> u8 {
     let q = byte.wrapping_mul(POW3[n]);
     ((q as u16 * 3) >> 8) as u8
@@ -59,6 +59,7 @@ pub fn unpack_block_trits(block: &[u8], out: &mut [u8; PTQ1_0_BLOCK_ELEMS]) {
 }
 
 /// Same element order as `unpack_block_trits`, as weights in -1..=1.
+#[inline(always)]
 pub fn unpack_block_signed(block: &[u8], out: &mut [i8; PTQ1_0_BLOCK_ELEMS]) {
     debug_assert_eq!(block.len(), PTQ1_0_BLOCK_BYTES);
     let mut j = 0;
