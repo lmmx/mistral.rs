@@ -2,6 +2,7 @@
 
 use half::f16;
 
+pub const PQ2_0_GGUF_TYPE: u32 = 142;
 pub const PQ2_0_BLOCK_ELEMS: usize = 128;
 pub const PQ2_0_BLOCK_BYTES: usize = 34;
 const SCALE_BYTES: usize = 2;
@@ -17,8 +18,10 @@ pub fn dequantize_row(bytes: &[u8], out: &mut [f32]) {
         out.len() / PQ2_0_BLOCK_ELEMS * PQ2_0_BLOCK_BYTES
     );
     for (block, dst) in bytes
-        .chunks_exact(PQ2_0_BLOCK_BYTES)
-        .zip(out.chunks_exact_mut(PQ2_0_BLOCK_ELEMS))
+        .as_chunks::<PQ2_0_BLOCK_BYTES>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<PQ2_0_BLOCK_ELEMS>().0.iter_mut())
     {
         let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
         let qs = &block[SCALE_BYTES..];

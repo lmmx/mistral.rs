@@ -2,6 +2,7 @@
 
 use half::f16;
 
+pub const PTQ1_0_GGUF_TYPE: u32 = 143;
 pub const PTQ1_0_BLOCK_ELEMS: usize = 128;
 pub const PTQ1_0_BLOCK_BYTES: usize = 28;
 const QS_BYTES: usize = 24;
@@ -55,8 +56,10 @@ pub fn dequantize_row(bytes: &[u8], out: &mut [f32]) {
     );
     let mut trits = [0u8; PTQ1_0_BLOCK_ELEMS];
     for (block, dst) in bytes
-        .chunks_exact(PTQ1_0_BLOCK_BYTES)
-        .zip(out.chunks_exact_mut(PTQ1_0_BLOCK_ELEMS))
+        .as_chunks::<PTQ1_0_BLOCK_BYTES>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<PTQ1_0_BLOCK_ELEMS>().0.iter_mut())
     {
         unpack_block_trits(block, &mut trits);
         let d = block_scale(block);
@@ -71,7 +74,7 @@ pub(crate) fn encode_block(
     codes: &[u8; PTQ1_0_BLOCK_ELEMS],
     scale: f32,
 ) -> [u8; PTQ1_0_BLOCK_BYTES] {
-    let ceil_pack = |q: u8| ((q as u16 * 256 + 242) / 243) as u8;
+    let ceil_pack = |q: u8| (q as u16 * 256).div_ceil(243) as u8;
     let mut block = [0u8; PTQ1_0_BLOCK_BYTES];
     let mut j = 0;
     let mut src = 0;

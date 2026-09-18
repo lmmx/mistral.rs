@@ -3,8 +3,13 @@ use std::{collections::HashMap, sync::Arc};
 use candle_core::{quantized::GgmlDType, DType, Device, Error, Result, Shape, Tensor};
 use candle_nn::{var_builder::SimpleBackend, Linear};
 
+use rayon::prelude::*;
+
 use super::{
     archive::{qtensor_from_gguf_data, GgufArchive, GgufEndian},
+    hadamard::HadamardSpec,
+    pq2_0::{self, PQ2_0_BLOCK_BYTES, PQ2_0_BLOCK_ELEMS, PQ2_0_GGUF_TYPE},
+    ptq1_0::{self, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS, PTQ1_0_GGUF_TYPE},
     GgufMatMul,
 };
 use crate::{
@@ -271,6 +276,7 @@ pub struct GgufWeightSource {
     shapes: HashMap<String, Vec<usize>>,
     output_dtypes: HashMap<String, DType>,
     dtype: DType,
+    hadamard: Option<HadamardSpec>,
 }
 
 struct PackedBinding {
@@ -325,13 +331,53 @@ impl GgufWeightSource {
             shapes.insert(native_name.clone(), shape);
             output_dtypes.insert(native_name, output_dtype);
         }
+        let hadamard = HadamardSpec::from_metadata(archive.metadata())?;
+        if let Some(spec) = &hadamard {
+            validate_hadamard_widths(&archive, spec)?;
+        }
         Ok(Self {
             archive,
             bindings,
             shapes,
             output_dtypes,
             dtype,
+            hadamard,
         })
+    }
+
+    /// Tensors that are decoded to dense floats at load instead of staying block-quantized.
+    fn is_decoded_on_load(&self, name: &str, raw_dtype: u32) -> bool {
+        matches!(raw_dtype, 0 | 1 | 30)
+            || is_prism_ternary(raw_dtype)
+            || self
+                .hadamard
+                .as_ref()
+                .is_some_and(|h| h.role(name).is_some())
+    }
+
+    fn materialize_source_tensor(&self, name: &str, device: &Device) -> Result<Tensor> {
+        let info = self.archive.tensor_info(name)?;
+        let raw = info.dtype().raw();
+        let role = self.hadamard.as_ref().filter(|h| h.role(name).is_some());
+        if role.is_none() && !is_prism_ternary(raw) {
+            return self.archive.load_qtensor(name, device)?.dequantize(device);
+        }
+        let shape = info.shape().to_vec();
+        let mut data = if is_prism_ternary(raw) {
+            decode_prism_ternary(raw, self.archive.tensor_data(name)?.bytes(), &shape)?
+        } else {
+            self.archive
+                .load_qtensor(name, &Device::Cpu)?
+                .dequantize(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?
+        };
+        if let Some(spec) = role {
+            let width = *shape.last().expect("GGUF tensors have at least one dim");
+            spec.apply(name, &mut data, width)?;
+        }
+        Tensor::from_vec(data, shape, &Device::Cpu)?.to_device(device)
     }
 
     pub fn archive(&self) -> &Arc<GgufArchive> {
@@ -391,10 +437,7 @@ impl GgufWeightSource {
 
     fn materialize_binding(&self, binding: &GgufTensorBinding, device: &Device) -> Result<Tensor> {
         match binding {
-            GgufTensorBinding::Tensor(name) => {
-                let tensor = self.archive.load_qtensor(name, device)?;
-                tensor.dequantize(device)
-            }
+            GgufTensorBinding::Tensor(name) => self.materialize_source_tensor(name, device),
             GgufTensorBinding::Mxfp4Blocks(name) => {
                 self.materialize_mxfp4_component(name, false, device)
             }
@@ -604,10 +647,10 @@ impl GgufWeightSource {
         match binding {
             GgufTensorBinding::Tensor(name) => {
                 let info = self.archive.tensor_info(name)?;
-                let dtype = info.dtype().candle_dtype()?;
-                if matches!(info.dtype().raw(), 0 | 1 | 30) {
+                if self.is_decoded_on_load(name, info.dtype().raw()) {
                     return Ok(None);
                 }
+                let dtype = info.dtype().candle_dtype()?;
                 Ok(Some(PackedBinding {
                     dtype,
                     dims: info.shape().to_vec(),
@@ -653,7 +696,7 @@ impl GgufWeightSource {
         match binding {
             GgufTensorBinding::Tensor(name) => {
                 let info = self.archive.tensor_info(name)?;
-                if matches!(info.dtype().raw(), 0 | 1 | 30) {
+                if self.is_decoded_on_load(name, info.dtype().raw()) {
                     Ok(None)
                 } else {
                     info.dtype().candle_dtype().map(Some)
@@ -724,7 +767,7 @@ impl GgufWeightSource {
         let resident_bytes = match binding.direct_tensor() {
             Some(source_name) => {
                 let info = self.archive.tensor_info(source_name)?;
-                if matches!(info.dtype().raw(), 0 | 1 | 30) {
+                if self.is_decoded_on_load(source_name, info.dtype().raw()) {
                     logical_elements
                         .checked_mul(dtype.size_in_bytes())
                         .ok_or_else(|| Error::msg("GGUF dense resident byte estimate overflow"))?
@@ -779,9 +822,9 @@ impl QuantizedWeightSource for GgufWeightSource {
         };
         match binding.direct_tensor() {
             Some(source_name)
-                if matches!(
+                if self.is_decoded_on_load(
+                    source_name,
                     self.archive.tensor_info(source_name)?.dtype().raw(),
-                    0 | 1 | 30
                 ) =>
             {
                 self.load_dense_linear(key, binding, device, shard)
@@ -1060,6 +1103,55 @@ impl SimpleBackend for GgufTensorBackend {
     }
 }
 
+fn is_prism_ternary(raw_dtype: u32) -> bool {
+    matches!(raw_dtype, PQ2_0_GGUF_TYPE | PTQ1_0_GGUF_TYPE)
+}
+
+fn decode_prism_ternary(raw_dtype: u32, bytes: &[u8], shape: &[usize]) -> Result<Vec<f32>> {
+    let (block_elems, block_bytes) = match raw_dtype {
+        PQ2_0_GGUF_TYPE => (PQ2_0_BLOCK_ELEMS, PQ2_0_BLOCK_BYTES),
+        _ => (PTQ1_0_BLOCK_ELEMS, PTQ1_0_BLOCK_BYTES),
+    };
+    let width = *shape.last().unwrap_or(&0);
+    if width == 0 || !width.is_multiple_of(block_elems) {
+        candle_core::bail!(
+            "ternary GGUF tensor row width {width} is not a multiple of {block_elems}"
+        );
+    }
+    let elems: usize = shape.iter().product();
+    let row_bytes = width / block_elems * block_bytes;
+    if bytes.len() != elems / width * row_bytes {
+        candle_core::bail!(
+            "ternary GGUF tensor has {} bytes for shape {shape:?}",
+            bytes.len()
+        );
+    }
+    let mut out = vec![0f32; elems];
+    out.par_chunks_mut(width)
+        .zip(bytes.par_chunks(row_bytes))
+        .for_each(|(dst, src)| match raw_dtype {
+            PQ2_0_GGUF_TYPE => pq2_0::dequantize_row(src, dst),
+            _ => ptq1_0::dequantize_row(src, dst),
+        });
+    Ok(out)
+}
+
+fn validate_hadamard_widths(archive: &GgufArchive, spec: &HadamardSpec) -> Result<()> {
+    for name in spec.folded_names() {
+        let Ok(info) = archive.tensor_info(name) else {
+            continue;
+        };
+        let width = info.shape().last().copied().unwrap_or(0);
+        if width == 0 || !width.is_multiple_of(spec.block_size()) {
+            candle_core::bail!(
+                "Hadamard tensor `{name}` width {width} is not a multiple of block {}",
+                spec.block_size()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_binding_storage(
     archive: &GgufArchive,
     binding: &GgufTensorBinding,
@@ -1068,7 +1160,7 @@ fn validate_binding_storage(
     match binding {
         GgufTensorBinding::Tensor(name) => {
             let dtype = archive.tensor_info(name)?.dtype();
-            if dtype.candle_dtype().is_err() {
+            if dtype.candle_dtype().is_err() && !is_prism_ternary(dtype.raw()) {
                 candle_core::bail!(
                     "GGUF tensor `{name}` uses dtype {} ({}) for native binding `{native_name}`; \
                      direct GGUF loading currently supports {DIRECT_GGUF_DTYPES}, while \
@@ -1347,6 +1439,56 @@ fn checked_elem_count(shape: &[usize]) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    const BONSAI_GGUF_ENV: &str = "BONSAI_GGUF";
+    const SAMPLE_WEIGHT: &str = "blk.3.attn_k.weight";
+    const TRIT_VALUES_PER_GROUP: usize = 3;
+
+    #[test]
+    #[ignore = "needs BONSAI_GGUF=<path to Ternary-Bonsai-2-27B-PTQ1_0.gguf>"]
+    fn real_bonsai_fold_decodes_and_unfolds() -> Result<()> {
+        let path = std::env::var(BONSAI_GGUF_ENV).expect("BONSAI_GGUF is not set");
+        let archive = GgufArchive::open_file(path)?;
+        let spec = HadamardSpec::from_metadata(archive.metadata())?.expect("no prism.hadamard.*");
+        assert_eq!(spec.block_size(), 1024);
+        for width in [5120usize, 6144, 17408] {
+            assert_eq!(spec.signs_for(width)?.len(), width);
+        }
+        validate_hadamard_widths(&archive, &spec)?;
+
+        let info = archive.tensor_info(SAMPLE_WEIGHT)?;
+        assert_eq!(info.dtype().raw(), PTQ1_0_GGUF_TYPE);
+        let shape = info.shape().to_vec();
+        let width = *shape.last().unwrap();
+        let stored = decode_prism_ternary(
+            PTQ1_0_GGUF_TYPE,
+            archive.tensor_data(SAMPLE_WEIGHT)?.bytes(),
+            &shape,
+        )?;
+        assert!(stored.iter().all(|v| v.is_finite()));
+        for group in stored.as_chunks::<PTQ1_0_BLOCK_ELEMS>().0 {
+            let scale = group.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let mut distinct: Vec<f32> = group.to_vec();
+            distinct.sort_by(f32::total_cmp);
+            distinct.dedup();
+            assert!(distinct.len() <= TRIT_VALUES_PER_GROUP);
+            assert!(distinct.iter().all(|v| *v == 0.0 || v.abs() == scale));
+        }
+        let zeros = stored.iter().filter(|v| **v == 0.0).count();
+        println!(
+            "{SAMPLE_WEIGHT} shape {shape:?}, zero fraction {:.3}",
+            zeros as f64 / stored.len() as f64
+        );
+
+        let mut unfolded = stored.clone();
+        spec.apply(SAMPLE_WEIGHT, &mut unfolded, width)?;
+        for (a, b) in stored.chunks_exact(width).zip(unfolded.chunks_exact(width)) {
+            let norm = |r: &[f32]| r.iter().map(|v| (*v as f64).powi(2)).sum::<f64>().sqrt();
+            assert!((norm(a) - norm(b)).abs() <= 1e-3 * norm(a).max(1.0));
+        }
+        assert_ne!(stored, unfolded);
+        Ok(())
+    }
+
     use std::io::Write;
 
     use candle_core::quantized::{gguf_file, GgmlDType, QTensor};
