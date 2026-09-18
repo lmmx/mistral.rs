@@ -14,7 +14,7 @@ const QS_STAGES: [usize; 3] = [32, 16, 8];
 const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
 
 #[inline]
-const fn trit(byte: u8, n: usize) -> u8 {
+pub(super) const fn trit(byte: u8, n: usize) -> u8 {
     let q = byte.wrapping_mul(POW3[n]);
     ((q as u16 * 3) >> 8) as u8
 }

@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use super::{
     archive::GgufArchive,
     hadamard::RowTransform,
-    ptq1_0::{dequantize_row, unpack_block_signed, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS},
+    ptq1_0::{dequantize_row, trit, unpack_block_signed, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS},
 };
 use crate::{
     IsqPlanParams, IsqRequest, IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard,
@@ -71,6 +71,11 @@ impl Ptq1_0Linear {
 
 const DOT_LANES: usize = 16;
 const MIN_ROWS_PER_TASK: usize = 16;
+const FUSED_MAX_TOKENS: usize = 2; // above this, decoding each block once beats redoing it per token
+const QS_WIDE: usize = 16;
+const QS_NARROW: usize = 8;
+const QS_NARROW_START: usize = QS_WIDE * 5;
+const QH_START: usize = QS_NARROW_START + QS_NARROW * 5;
 
 /// Independent lanes let LLVM vectorize; a single float sum would stay a serial chain.
 #[inline]
@@ -89,6 +94,30 @@ fn block_dot(signed: &[i8; PTQ1_0_BLOCK_ELEMS], x: &[f32]) -> f32 {
     lanes.iter().sum()
 }
 
+/// Unscaled dot of one packed block with `x`, decoding trits in lanes across the stage bytes.
+#[inline]
+fn block_dot_fused(block: &[u8; PTQ1_0_BLOCK_BYTES], x: &[f32]) -> f32 {
+    let mut acc = [0f32; QS_WIDE];
+    for n in 0..5 {
+        for m in 0..QS_WIDE {
+            acc[m] += (trit(block[m], n) as i32 - 1) as f32 * x[n * QS_WIDE + m];
+        }
+    }
+    for n in 0..5 {
+        for m in 0..QS_NARROW {
+            let t = trit(block[QS_WIDE + m], n) as i32 - 1;
+            acc[m] += t as f32 * x[QS_NARROW_START + n * QS_NARROW + m];
+        }
+    }
+    for n in 0..4 {
+        for h in 0..2 {
+            let t = trit(block[QS_WIDE + QS_NARROW + h], n) as i32 - 1;
+            acc[h] += t as f32 * x[QH_START + n * 2 + h];
+        }
+    }
+    acc.iter().sum()
+}
+
 /// Returns `[tokens, out_dim]` for already-transformed activations `xt` of shape `[tokens, in_dim]`.
 fn packed_matmul(
     bytes: &[u8],
@@ -105,13 +134,21 @@ fn packed_matmul(
         .with_min_len(MIN_ROWS_PER_TASK)
         .for_each(|(acc, row)| {
             let mut signed = [0i8; PTQ1_0_BLOCK_ELEMS];
+            let fused = tokens <= FUSED_MAX_TOKENS;
             for (b, block) in row.as_chunks::<PTQ1_0_BLOCK_BYTES>().0.iter().enumerate() {
-                unpack_block_signed(block, &mut signed);
+                if !fused {
+                    unpack_block_signed(block, &mut signed);
+                }
                 let d = super::ptq1_0::block_scale(block);
                 for (t, a) in acc.iter_mut().enumerate() {
                     let start = t * in_dim + b * PTQ1_0_BLOCK_ELEMS;
                     let x = &xt[start..start + PTQ1_0_BLOCK_ELEMS];
-                    *a += d * block_dot(&signed, x);
+                    let dot = if fused {
+                        block_dot_fused(block, x)
+                    } else {
+                        block_dot(&signed, x)
+                    };
+                    *a += d * dot;
                 }
             }
         });
@@ -274,7 +311,13 @@ mod tests {
 
     #[test]
     fn packed_matmul_matches_dequantized_dense() {
-        let (out_dim, in_dim, tokens) = (37, 384, 3);
+        for tokens in [1, FUSED_MAX_TOKENS + 1] {
+            check_against_dense(tokens);
+        }
+    }
+
+    fn check_against_dense(tokens: usize) {
+        let (out_dim, in_dim) = (37, 384);
         let (bytes, x) = synthetic(out_dim, in_dim, tokens);
         let mut w = vec![0f32; out_dim * in_dim];
         w.chunks_mut(in_dim)
@@ -298,7 +341,7 @@ mod tests {
     #[test]
     #[ignore = "timing"]
     fn packed_matmul_speed() {
-        for tokens in [1, 16] {
+        for tokens in [1, 2, 3, 16] {
             let (out_dim, in_dim) = (5120, 17408);
             let (bytes, x) = synthetic(out_dim, in_dim, tokens);
             packed_matmul(&bytes, out_dim, in_dim, &x, tokens);
