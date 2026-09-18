@@ -141,9 +141,90 @@ impl HadamardSpec {
         Ok(())
     }
 
+    /// Runtime activation/embedding transform for a folded tensor, `None` when the tensor is not folded.
+    pub fn row_transform(&self, name: &str, width: usize) -> Result<Option<RowTransform>> {
+        let Some(role) = self.role(name) else {
+            return Ok(None);
+        };
+        let gather = match (role, self.ssm_out_heads) {
+            (HadamardRole::Fold, Some(heads)) if name.ends_with(SSM_OUT_SUFFIX) => {
+                Some(tiled_to_grouped_gather(width, heads))
+            }
+            _ => None,
+        };
+        Ok(Some(RowTransform {
+            role,
+            block: self.block,
+            signs: self.signs_for(width)?,
+            gather,
+        }))
+    }
+
     pub fn folded_names(&self) -> impl Iterator<Item = &str> {
         self.weights.iter().chain(&self.inverse).map(String::as_str)
     }
+}
+
+/// Per-row runtime form of the fold: activations get `H(s * x)`, latent embedding rows get `s * (H z)`.
+#[derive(Clone, Debug)]
+pub struct RowTransform {
+    role: HadamardRole,
+    block: usize,
+    signs: Arc<[f32]>,
+    gather: Option<Vec<u32>>,
+}
+
+impl RowTransform {
+    /// Dense equivalent of a stored `[rows, width]` weight: the offline form of `apply` on activations.
+    pub fn unfold_weight(&self, data: &mut [f32]) {
+        let width = self.signs.len();
+        unfold_rows(data, width, self.block, &self.signs);
+        if let Some(gather) = &self.gather {
+            data.par_chunks_exact_mut(width).for_each(|row| {
+                let src = row.to_vec();
+                for (from, to) in gather.iter().enumerate() {
+                    row[*to as usize] = src[from];
+                }
+            });
+        }
+    }
+
+    pub fn apply(&self, row: &mut [f32], scratch: &mut Vec<f32>) {
+        debug_assert_eq!(row.len(), self.signs.len());
+        match self.role {
+            HadamardRole::Fold => {
+                if let Some(gather) = &self.gather {
+                    scratch.clear();
+                    scratch.extend(gather.iter().map(|i| row[*i as usize]));
+                    row.copy_from_slice(scratch);
+                }
+                row.iter_mut()
+                    .zip(self.signs.iter())
+                    .for_each(|(v, s)| *v *= s);
+                row.chunks_exact_mut(self.block).for_each(fwht_normalized);
+            }
+            HadamardRole::Inverse => {
+                row.chunks_exact_mut(self.block).for_each(fwht_normalized);
+                row.iter_mut()
+                    .zip(self.signs.iter())
+                    .for_each(|(v, s)| *v *= s);
+            }
+        }
+    }
+}
+
+/// `gather[c_grouped] = c_tiled` for the `ssm_out` input, so `x_grouped[i] = x_tiled[gather[i]]`.
+fn tiled_to_grouped_gather(width: usize, heads: GdnHeads) -> Vec<u32> {
+    let GdnHeads { hd, nk, rep } = heads;
+    let mut gather = vec![0u32; width];
+    for k in 0..nk {
+        for r in 0..rep {
+            for h in 0..hd {
+                gather[h + hd * (r + rep * k)] = (h + hd * (k + nk * r)) as u32;
+            }
+        }
+    }
+    gather
 }
 
 fn gdn_heads(metadata: &HashMap<String, Value>) -> Result<GdnHeads> {
@@ -511,6 +592,35 @@ mod tests {
         spec.apply("blk.0.ssm_alpha.weight", &mut untouched, width)
             .unwrap();
         assert_eq!(untouched, vec![1.0f32; width]);
+    }
+
+    #[test]
+    fn row_transform_matches_unfolded_weight_dot() {
+        let mut pairs = base_metadata(SIGN_MODE_IDENTITY);
+        pairs.retain(|(k, _)| *k != KEY_WEIGHT_NAMES);
+        pairs.push((KEY_WEIGHT_NAMES, strings(&["blk.0.ssm_out.weight"])));
+        let spec = HadamardSpec::from_metadata(&meta(pairs)).unwrap().unwrap();
+        let width = 12;
+        let stored = random(width, 31);
+        let x = random(width, 32);
+
+        let mut unfolded = stored.clone();
+        spec.apply("blk.0.ssm_out.weight", &mut unfolded, width)
+            .unwrap();
+        let want: f32 = unfolded.iter().zip(&x).map(|(w, a)| w * a).sum();
+
+        let transform = spec
+            .row_transform("blk.0.ssm_out.weight", width)
+            .unwrap()
+            .unwrap();
+        let mut xt = x;
+        transform.apply(&mut xt, &mut Vec::new());
+        let got: f32 = stored.iter().zip(&xt).map(|(w, a)| w * a).sum();
+        assert!((got - want).abs() < 1e-5, "{got} vs {want}");
+        assert!(spec
+            .row_transform("blk.0.ssm_alpha.weight", width)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

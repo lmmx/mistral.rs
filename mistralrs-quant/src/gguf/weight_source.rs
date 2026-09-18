@@ -10,6 +10,7 @@ use super::{
     hadamard::HadamardSpec,
     pq2_0::{self, PQ2_0_BLOCK_BYTES, PQ2_0_BLOCK_ELEMS, PQ2_0_GGUF_TYPE},
     ptq1_0::{self, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS, PTQ1_0_GGUF_TYPE},
+    ptq1_0_linear::Ptq1_0Linear,
     GgufMatMul,
 };
 use crate::{
@@ -18,6 +19,7 @@ use crate::{
     TensorShapes, UnquantLinear,
 };
 
+const PTQ1_0_DENSE_ENV: &str = "MISTRALRS_PTQ1_0_DENSE";
 const DIRECT_GGUF_DTYPES: &str =
     "F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, and Q2_K through Q8_K";
 
@@ -277,6 +279,7 @@ pub struct GgufWeightSource {
     output_dtypes: HashMap<String, DType>,
     dtype: DType,
     hadamard: Option<HadamardSpec>,
+    packed_ternary_on_cpu: bool,
 }
 
 struct PackedBinding {
@@ -342,7 +345,46 @@ impl GgufWeightSource {
             output_dtypes,
             dtype,
             hadamard,
+            packed_ternary_on_cpu: std::env::var_os(PTQ1_0_DENSE_ENV).is_none(),
         })
+    }
+
+    #[cfg(test)]
+    fn set_packed_ternary_on_cpu(&mut self, on: bool) {
+        self.packed_ternary_on_cpu = on;
+    }
+
+    /// Keeps PTQ1_0 blocks packed (fold applied to activations) for unsharded CPU linears.
+    fn try_load_packed_ternary(
+        &self,
+        key: &str,
+        source_name: &str,
+        device: &Device,
+        shard: Shard,
+    ) -> Result<Option<Arc<dyn QuantMethod>>> {
+        let info = self.archive.tensor_info(source_name)?;
+        if !self.packed_ternary_on_cpu
+            || !device.is_cpu()
+            || info.dtype().raw() != PTQ1_0_GGUF_TYPE
+            || info.shape().len() != 2
+            || shard_range(shard, info.shape())?.is_some()
+        {
+            return Ok(None);
+        }
+        let width = info.shape()[1];
+        let transform = match &self.hadamard {
+            Some(spec) => spec.row_transform(source_name, width)?,
+            None => None,
+        };
+        let bias = self.load_bias(key, device, None, 2)?;
+        let layer = Ptq1_0Linear::new(
+            self.archive.clone(),
+            source_name,
+            transform,
+            bias,
+            self.dtype,
+        )?;
+        Ok(Some(Arc::new(layer)))
     }
 
     /// Tensors that are decoded to dense floats at load instead of staying block-quantized.
@@ -820,6 +862,11 @@ impl QuantizedWeightSource for GgufWeightSource {
         let Some(binding) = self.bindings.get(&weight_name) else {
             return Ok(None);
         };
+        if let Some(source_name) = binding.direct_tensor() {
+            if let Some(layer) = self.try_load_packed_ternary(key, source_name, device, shard)? {
+                return Ok(Some(layer));
+            }
+        }
         match binding.direct_tensor() {
             Some(source_name)
                 if self.is_decoded_on_load(
@@ -1444,6 +1491,7 @@ mod tests {
     const FOLD_OUT: usize = 4;
     const FOLD_TENSOR: &str = "blk.0.ffn_down.weight";
     const PLAIN_TENSOR: &str = "blk.0.ffn_up.weight";
+    const EMBD_TENSOR: &str = "token_embd.weight";
 
     fn kv_string(bytes: &mut Vec<u8>, key: &str, value: &str) {
         push_key(bytes, key, 8);
@@ -1526,11 +1574,18 @@ mod tests {
                 .map(|s| (*s as i32).to_le_bytes().to_vec())
                 .collect();
             kv_array(&mut kvs, "prism.hadamard.sign_values", 5, &signs);
-            kv_count = 8;
+            kv_array(
+                &mut kvs,
+                "prism.hadamard.inverse_weight_names",
+                8,
+                &[string_elem(EMBD_TENSOR)],
+            );
+            kv_count = 9;
         }
         let tensors = [
             (FOLD_TENSOR, test_trit_rows(0)),
             (PLAIN_TENSOR, test_trit_rows(1)),
+            (EMBD_TENSOR, test_trit_rows(2)),
         ];
         let mut header = Vec::new();
         header.extend_from_slice(b"GGUF");
@@ -1561,13 +1616,18 @@ mod tests {
         Ok((file, archive))
     }
 
-    fn fold_source(with_fold: bool) -> Result<(NamedTempFile, Arc<GgufWeightSource>)> {
+    fn fold_source(
+        with_fold: bool,
+        packed: bool,
+    ) -> Result<(NamedTempFile, Arc<GgufWeightSource>)> {
         let (file, archive) = fold_archive(with_fold)?;
         let bindings = GgufBindingMap::new()
             .with_binding("model.down.weight", GgufTensorBinding::tensor(FOLD_TENSOR))
-            .with_binding("model.up.weight", GgufTensorBinding::tensor(PLAIN_TENSOR));
-        let source = Arc::new(GgufWeightSource::new(archive, &bindings, DType::F32)?);
-        Ok((file, source))
+            .with_binding("model.up.weight", GgufTensorBinding::tensor(PLAIN_TENSOR))
+            .with_binding("model.embd.weight", GgufTensorBinding::tensor(EMBD_TENSOR));
+        let mut source = GgufWeightSource::new(archive, &bindings, DType::F32)?;
+        source.set_packed_ternary_on_cpu(packed);
+        Ok((file, Arc::new(source)))
     }
 
     fn decoded(seed: usize) -> Vec<f32> {
@@ -1576,8 +1636,15 @@ mod tests {
     }
 
     #[test]
-    fn folded_ternary_linear_loads_unfolded_and_matches_runtime_fold() -> Result<()> {
-        let (_file, source) = fold_source(true)?;
+    fn folded_ternary_linear_matches_runtime_fold_packed_and_dense() -> Result<()> {
+        for packed in [true, false] {
+            folded_linear_matches_runtime_fold(packed)?;
+        }
+        Ok(())
+    }
+
+    fn folded_linear_matches_runtime_fold(packed: bool) -> Result<()> {
+        let (_file, source) = fold_source(true, packed)?;
         let stored = decoded(0);
         let x: Vec<f32> = (0..FOLD_IN)
             .map(|i| ((i * 13) % 17) as f32 / 8.0 - 1.0)
@@ -1608,9 +1675,28 @@ mod tests {
     }
 
     #[test]
+    fn inverse_embedding_rows_agree_between_packed_and_dense() -> Result<()> {
+        let ids = Tensor::from_vec(vec![3u32, 0, 2, 2], (2, 2), &Device::Cpu)?;
+        let mut outputs = Vec::new();
+        for packed in [true, false] {
+            let (_file, source) = fold_source(true, packed)?;
+            let layer = source
+                .load_linear("model.embd", &Device::Cpu, Shard::default())?
+                .unwrap();
+            let rows = layer.embedding_forward(&ids, DType::F32)?;
+            assert_eq!(rows.dims(), [2, 2, FOLD_IN]);
+            outputs.push(rows.flatten_all()?.to_vec1::<f32>()?);
+        }
+        for (a, b) in outputs[0].iter().zip(&outputs[1]) {
+            assert!((a - b).abs() < 1e-4, "{a} vs {b}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn unfolded_names_and_folds_absent_from_metadata_decode_plainly() -> Result<()> {
-        for with_fold in [true, false] {
-            let (_file, source) = fold_source(with_fold)?;
+        for (with_fold, packed) in [(true, true), (true, false), (false, true), (false, false)] {
+            let (_file, source) = fold_source(with_fold, packed)?;
             let layer = source
                 .load_linear("model.up", &Device::Cpu, Shard::default())?
                 .unwrap();
@@ -1623,6 +1709,62 @@ mod tests {
     const BONSAI_GGUF_ENV: &str = "BONSAI_GGUF";
     const SAMPLE_WEIGHT: &str = "blk.3.attn_k.weight";
     const TRIT_VALUES_PER_GROUP: usize = 3;
+
+    #[test]
+    #[ignore = "needs BONSAI_GGUF=<path to Ternary-Bonsai-2-27B-PTQ1_0.gguf>"]
+    fn real_bonsai_packed_matches_dense() -> Result<()> {
+        let path = std::env::var(BONSAI_GGUF_ENV).expect("BONSAI_GGUF is not set");
+        let mut outputs = Vec::new();
+        for packed in [true, false] {
+            let archive = Arc::new(GgufArchive::open_file(&path)?);
+            let bindings = GgufBindingMap::new()
+                .with_binding(
+                    "m.k.weight",
+                    GgufTensorBinding::tensor("blk.3.attn_k.weight"),
+                )
+                .with_binding(
+                    "m.out.weight",
+                    GgufTensorBinding::tensor("blk.0.ssm_out.weight"),
+                )
+                .with_binding(
+                    "m.embd.weight",
+                    GgufTensorBinding::tensor("token_embd.weight"),
+                );
+            let mut source = GgufWeightSource::new(archive, &bindings, DType::F32)?;
+            source.set_packed_ternary_on_cpu(packed);
+            let mut results = Vec::new();
+            for (key, width) in [("m.k", 5120usize), ("m.out", 6144)] {
+                let x: Vec<f32> = (0..2 * width)
+                    .map(|i| ((i * 31) % 97) as f32 / 48.0 - 1.0)
+                    .collect();
+                let input = Tensor::from_vec(x, (2, width), &Device::Cpu)?;
+                let layer = source
+                    .load_linear(key, &Device::Cpu, Shard::default())?
+                    .unwrap();
+                results.push(layer.forward(&input)?.flatten_all()?.to_vec1::<f32>()?);
+            }
+            let ids = Tensor::from_vec(vec![0u32, 1000, 248000], (3,), &Device::Cpu)?;
+            let embd = source
+                .load_linear("m.embd", &Device::Cpu, Shard::default())?
+                .unwrap();
+            results.push(
+                embd.embedding_forward(&ids, DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?,
+            );
+            outputs.push(results);
+        }
+        for (packed, dense) in outputs[0].iter().zip(&outputs[1]) {
+            let scale = dense.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            let worst = packed
+                .iter()
+                .zip(dense)
+                .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            println!("max abs diff {worst} at scale {scale}");
+            assert!(worst <= 2e-3 * scale);
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "needs BONSAI_GGUF=<path to Ternary-Bonsai-2-27B-PTQ1_0.gguf>"]
