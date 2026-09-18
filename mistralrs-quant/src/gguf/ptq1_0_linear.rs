@@ -77,9 +77,11 @@ const QS_NARROW: usize = 8;
 const QS_NARROW_START: usize = QS_WIDE * 5;
 const QH_START: usize = QS_NARROW_START + QS_NARROW * 5;
 
-/// Independent lanes let LLVM vectorize; a single float sum would stay a serial chain.
+type Lanes = [f32; DOT_LANES];
+
+/// Per-lane partial sums; reducing across lanes once per row keeps the hot loop free of serial adds.
 #[inline]
-fn block_dot(signed: &[i8; PTQ1_0_BLOCK_ELEMS], x: &[f32]) -> f32 {
+fn block_dot(signed: &[i8; PTQ1_0_BLOCK_ELEMS], x: &[f32]) -> Lanes {
     let mut lanes = [0f32; DOT_LANES];
     for (s, x) in signed
         .as_chunks::<DOT_LANES>()
@@ -91,7 +93,7 @@ fn block_dot(signed: &[i8; PTQ1_0_BLOCK_ELEMS], x: &[f32]) -> f32 {
             lanes[i] += s[i] as f32 * x[i];
         }
     }
-    lanes.iter().sum()
+    lanes
 }
 
 /// Unscaled dot of one packed block with `x`, decoding trits in lanes across the stage bytes.
@@ -132,26 +134,40 @@ fn packed_matmul(
         .par_chunks_mut(tokens)
         .zip(bytes.par_chunks(row_bytes))
         .with_min_len(MIN_ROWS_PER_TASK)
-        .for_each(|(acc, row)| {
-            let mut signed = [0i8; PTQ1_0_BLOCK_ELEMS];
-            let fused = tokens <= FUSED_MAX_TOKENS;
-            for (b, block) in row.as_chunks::<PTQ1_0_BLOCK_BYTES>().0.iter().enumerate() {
-                if !fused {
+        .for_each_init(
+            || vec![[0f32; DOT_LANES]; tokens],
+            |lanes, (acc, row)| {
+                lanes.fill([0f32; DOT_LANES]);
+                let blocks = row.as_chunks::<PTQ1_0_BLOCK_BYTES>().0;
+                if tokens <= FUSED_MAX_TOKENS {
+                    acc.fill(0.0);
+                    for (b, block) in blocks.iter().enumerate() {
+                        let d = super::ptq1_0::block_scale(block);
+                        for (t, a) in acc.iter_mut().enumerate() {
+                            let start = t * in_dim + b * PTQ1_0_BLOCK_ELEMS;
+                            *a +=
+                                d * block_dot_fused(block, &xt[start..start + PTQ1_0_BLOCK_ELEMS]);
+                        }
+                    }
+                    return;
+                }
+                let mut signed = [0i8; PTQ1_0_BLOCK_ELEMS];
+                for (b, block) in blocks.iter().enumerate() {
                     unpack_block_signed(block, &mut signed);
+                    let d = super::ptq1_0::block_scale(block);
+                    for (t, l) in lanes.iter_mut().enumerate() {
+                        let start = t * in_dim + b * PTQ1_0_BLOCK_ELEMS;
+                        let part = block_dot(&signed, &xt[start..start + PTQ1_0_BLOCK_ELEMS]);
+                        for (l, p) in l.iter_mut().zip(part) {
+                            *l += d * p;
+                        }
+                    }
                 }
-                let d = super::ptq1_0::block_scale(block);
-                for (t, a) in acc.iter_mut().enumerate() {
-                    let start = t * in_dim + b * PTQ1_0_BLOCK_ELEMS;
-                    let x = &xt[start..start + PTQ1_0_BLOCK_ELEMS];
-                    let dot = if fused {
-                        block_dot_fused(block, x)
-                    } else {
-                        block_dot(&signed, x)
-                    };
-                    *a += d * dot;
+                for (a, l) in acc.iter_mut().zip(lanes.iter()) {
+                    *a = l.iter().sum();
                 }
-            }
-        });
+            },
+        );
     let mut out = vec![0f32; tokens * out_dim];
     for (r, col) in by_row.chunks_exact(tokens).enumerate() {
         for (t, v) in col.iter().enumerate() {
