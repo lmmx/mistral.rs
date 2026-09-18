@@ -69,6 +69,26 @@ impl Ptq1_0Linear {
     }
 }
 
+const DOT_LANES: usize = 16;
+const MIN_ROWS_PER_TASK: usize = 16;
+
+/// Independent lanes let LLVM vectorize; a single float sum would stay a serial chain.
+#[inline]
+fn block_dot(signed: &[i8; PTQ1_0_BLOCK_ELEMS], x: &[f32]) -> f32 {
+    let mut lanes = [0f32; DOT_LANES];
+    for (s, x) in signed
+        .as_chunks::<DOT_LANES>()
+        .0
+        .iter()
+        .zip(x.as_chunks::<DOT_LANES>().0)
+    {
+        for i in 0..DOT_LANES {
+            lanes[i] += s[i] as f32 * x[i];
+        }
+    }
+    lanes.iter().sum()
+}
+
 /// Returns `[tokens, out_dim]` for already-transformed activations `xt` of shape `[tokens, in_dim]`.
 fn packed_matmul(
     bytes: &[u8],
@@ -82,6 +102,7 @@ fn packed_matmul(
     by_row
         .par_chunks_mut(tokens)
         .zip(bytes.par_chunks(row_bytes))
+        .with_min_len(MIN_ROWS_PER_TASK)
         .for_each(|(acc, row)| {
             let mut signed = [0i8; PTQ1_0_BLOCK_ELEMS];
             for (b, block) in row.as_chunks::<PTQ1_0_BLOCK_BYTES>().0.iter().enumerate() {
@@ -90,8 +111,7 @@ fn packed_matmul(
                 for (t, a) in acc.iter_mut().enumerate() {
                     let start = t * in_dim + b * PTQ1_0_BLOCK_ELEMS;
                     let x = &xt[start..start + PTQ1_0_BLOCK_ELEMS];
-                    let dot: f32 = signed.iter().zip(x).map(|(s, x)| *s as f32 * x).sum();
-                    *a += d * dot;
+                    *a += d * block_dot(&signed, x);
                 }
             }
         });
@@ -216,5 +236,83 @@ impl QuantMethod for Ptq1_0Linear {
 impl QuantizedSerde for Ptq1_0Linear {
     fn name(&self) -> &'static str {
         "ptq1_0"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::gguf::ptq1_0::encode_block;
+
+    const LCG_MUL: u64 = 6364136223846793005;
+
+    fn lcg(state: &mut u64) -> u32 {
+        *state = state
+            .wrapping_mul(LCG_MUL)
+            .wrapping_add(1442695040888963407);
+        (*state >> 33) as u32
+    }
+
+    fn synthetic(out_dim: usize, in_dim: usize, tokens: usize) -> (Vec<u8>, Vec<f32>) {
+        let mut s = 7u64;
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim * in_dim / PTQ1_0_BLOCK_ELEMS {
+            let mut codes = [0u8; PTQ1_0_BLOCK_ELEMS];
+            codes.iter_mut().for_each(|c| *c = (lcg(&mut s) % 3) as u8);
+            bytes.extend_from_slice(&encode_block(
+                &codes,
+                0.01 + (lcg(&mut s) % 100) as f32 * 1e-4,
+            ));
+        }
+        let x = (0..tokens * in_dim)
+            .map(|_| (lcg(&mut s) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        (bytes, x)
+    }
+
+    #[test]
+    fn packed_matmul_matches_dequantized_dense() {
+        let (out_dim, in_dim, tokens) = (37, 384, 3);
+        let (bytes, x) = synthetic(out_dim, in_dim, tokens);
+        let mut w = vec![0f32; out_dim * in_dim];
+        w.chunks_mut(in_dim)
+            .zip(bytes.chunks(in_dim / PTQ1_0_BLOCK_ELEMS * PTQ1_0_BLOCK_BYTES))
+            .for_each(|(d, s)| dequantize_row(s, d));
+        let got = packed_matmul(&bytes, out_dim, in_dim, &x, tokens);
+        for t in 0..tokens {
+            for r in 0..out_dim {
+                let want: f32 = (0..in_dim)
+                    .map(|c| w[r * in_dim + c] * x[t * in_dim + c])
+                    .sum();
+                let g = got[t * out_dim + r];
+                assert!(
+                    (g - want).abs() < 1e-3 * want.abs().max(1.0),
+                    "{g} vs {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "timing"]
+    fn packed_matmul_speed() {
+        for tokens in [1, 16] {
+            let (out_dim, in_dim) = (5120, 17408);
+            let (bytes, x) = synthetic(out_dim, in_dim, tokens);
+            packed_matmul(&bytes, out_dim, in_dim, &x, tokens);
+            let start = Instant::now();
+            let reps = 5;
+            for _ in 0..reps {
+                std::hint::black_box(packed_matmul(&bytes, out_dim, in_dim, &x, tokens));
+            }
+            let secs = start.elapsed().as_secs_f64() / reps as f64;
+            let gbps = bytes.len() as f64 / secs / 1e9;
+            eprintln!(
+                "tokens {tokens}: {:.1} ms, {gbps:.2} GB/s of weights",
+                secs * 1e3
+            );
+        }
     }
 }
