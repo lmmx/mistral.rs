@@ -10,6 +10,8 @@ pub mod fast_mmvq;
 mod ffi;
 #[cfg(all(feature = "cuda", has_marlin_kernels))]
 mod packed_affine;
+mod pq2_0;
+mod ptq1_0;
 mod weight_source;
 
 pub use weight_source::{
