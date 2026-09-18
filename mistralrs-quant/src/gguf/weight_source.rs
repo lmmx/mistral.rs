@@ -1439,6 +1439,187 @@ fn checked_elem_count(shape: &[usize]) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    const FOLD_BLOCK: usize = 128;
+    const FOLD_IN: usize = 256;
+    const FOLD_OUT: usize = 4;
+    const FOLD_TENSOR: &str = "blk.0.ffn_down.weight";
+    const PLAIN_TENSOR: &str = "blk.0.ffn_up.weight";
+
+    fn kv_string(bytes: &mut Vec<u8>, key: &str, value: &str) {
+        push_key(bytes, key, 8);
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn push_key(bytes: &mut Vec<u8>, key: &str, ty: u32) {
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(&ty.to_le_bytes());
+    }
+
+    fn kv_u32(bytes: &mut Vec<u8>, key: &str, value: u32) {
+        push_key(bytes, key, 4);
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn kv_array(bytes: &mut Vec<u8>, key: &str, elem_ty: u32, elems: &[Vec<u8>]) {
+        push_key(bytes, key, 9);
+        bytes.extend_from_slice(&elem_ty.to_le_bytes());
+        bytes.extend_from_slice(&(elems.len() as u64).to_le_bytes());
+        elems.iter().for_each(|e| bytes.extend_from_slice(e));
+    }
+
+    fn string_elem(value: &str) -> Vec<u8> {
+        let mut out = (value.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(value.as_bytes());
+        out
+    }
+
+    fn test_signs() -> Vec<f32> {
+        (0..FOLD_IN)
+            .map(|i| if (i * 5 + i / 3) % 3 == 0 { -1.0 } else { 1.0 })
+            .collect()
+    }
+
+    fn test_trit_rows(seed: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        for row in 0..FOLD_OUT {
+            for blk in 0..FOLD_IN / PTQ1_0_BLOCK_ELEMS {
+                let mut codes = [0u8; PTQ1_0_BLOCK_ELEMS];
+                for (i, c) in codes.iter_mut().enumerate() {
+                    *c = ((i * 3 + row * 7 + blk * 11 + seed) % 3) as u8;
+                }
+                let scale = 0.25 * (1 + row + blk) as f32;
+                data.extend_from_slice(&ptq1_0::encode_block(&codes, scale));
+            }
+        }
+        data
+    }
+
+    fn fold_archive(with_fold: bool) -> Result<(NamedTempFile, Arc<GgufArchive>)> {
+        let mut kvs = Vec::new();
+        let mut kv_count = 0u64;
+        if with_fold {
+            kv_u32(&mut kvs, "prism.hadamard.version", 1);
+            kv_u32(&mut kvs, "prism.hadamard.block_size", FOLD_BLOCK as u32);
+            kv_string(
+                &mut kvs,
+                "prism.hadamard.transform",
+                "normalized-sylvester-walsh-hadamard",
+            );
+            kv_string(&mut kvs, "prism.hadamard.axis", "input-last-dimension");
+            kv_string(&mut kvs, "prism.hadamard.sign_mode", "explicit");
+            kv_array(
+                &mut kvs,
+                "prism.hadamard.weight_names",
+                8,
+                &[string_elem(FOLD_TENSOR)],
+            );
+            kv_array(
+                &mut kvs,
+                "prism.hadamard.sign_widths",
+                4,
+                &[(FOLD_IN as u32).to_le_bytes().to_vec()],
+            );
+            let signs: Vec<Vec<u8>> = test_signs()
+                .iter()
+                .map(|s| (*s as i32).to_le_bytes().to_vec())
+                .collect();
+            kv_array(&mut kvs, "prism.hadamard.sign_values", 5, &signs);
+            kv_count = 8;
+        }
+        let tensors = [
+            (FOLD_TENSOR, test_trit_rows(0)),
+            (PLAIN_TENSOR, test_trit_rows(1)),
+        ];
+        let mut header = Vec::new();
+        header.extend_from_slice(b"GGUF");
+        header.extend_from_slice(&3u32.to_le_bytes());
+        header.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        header.extend_from_slice(&kv_count.to_le_bytes());
+        header.extend_from_slice(&kvs);
+        let mut offset = 0u64;
+        for (name, data) in &tensors {
+            header.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            header.extend_from_slice(name.as_bytes());
+            header.extend_from_slice(&2u32.to_le_bytes());
+            header.extend_from_slice(&(FOLD_IN as u64).to_le_bytes());
+            header.extend_from_slice(&(FOLD_OUT as u64).to_le_bytes());
+            header.extend_from_slice(&PTQ1_0_GGUF_TYPE.to_le_bytes());
+            header.extend_from_slice(&offset.to_le_bytes());
+            offset += align(data.len(), 32) as u64;
+        }
+        header.resize(align(header.len(), 32), 0);
+        for (_, data) in &tensors {
+            header.extend_from_slice(data);
+            header.resize(align(header.len(), 32), 0);
+        }
+        let mut file = NamedTempFile::new().map_err(Error::wrap)?;
+        file.as_file_mut().write_all(&header).map_err(Error::wrap)?;
+        file.as_file_mut().flush().map_err(Error::wrap)?;
+        let archive = Arc::new(GgufArchive::open_file(file.path())?);
+        Ok((file, archive))
+    }
+
+    fn fold_source(with_fold: bool) -> Result<(NamedTempFile, Arc<GgufWeightSource>)> {
+        let (file, archive) = fold_archive(with_fold)?;
+        let bindings = GgufBindingMap::new()
+            .with_binding("model.down.weight", GgufTensorBinding::tensor(FOLD_TENSOR))
+            .with_binding("model.up.weight", GgufTensorBinding::tensor(PLAIN_TENSOR));
+        let source = Arc::new(GgufWeightSource::new(archive, &bindings, DType::F32)?);
+        Ok((file, source))
+    }
+
+    fn decoded(seed: usize) -> Vec<f32> {
+        let bytes = test_trit_rows(seed);
+        decode_prism_ternary(PTQ1_0_GGUF_TYPE, &bytes, &[FOLD_OUT, FOLD_IN]).unwrap()
+    }
+
+    #[test]
+    fn folded_ternary_linear_loads_unfolded_and_matches_runtime_fold() -> Result<()> {
+        let (_file, source) = fold_source(true)?;
+        let stored = decoded(0);
+        let x: Vec<f32> = (0..FOLD_IN)
+            .map(|i| ((i * 13) % 17) as f32 / 8.0 - 1.0)
+            .collect();
+
+        let mut xt: Vec<f32> = x.iter().zip(test_signs()).map(|(a, s)| a * s).collect();
+        xt.as_chunks_mut::<FOLD_BLOCK>()
+            .0
+            .iter_mut()
+            .for_each(|b| super::super::hadamard::fwht_normalized(b));
+        let want: Vec<f32> = stored
+            .as_chunks::<FOLD_IN>()
+            .0
+            .iter()
+            .map(|row| row.iter().zip(&xt).map(|(w, a)| w * a).sum())
+            .collect();
+
+        let layer = source
+            .load_linear("model.down", &Device::Cpu, Shard::default())?
+            .unwrap();
+        let input = Tensor::from_vec(x, (1, FOLD_IN), &Device::Cpu)?;
+        let got = layer.forward(&input)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(got.len(), FOLD_OUT);
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-3, "{g} vs {w}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unfolded_names_and_folds_absent_from_metadata_decode_plainly() -> Result<()> {
+        for with_fold in [true, false] {
+            let (_file, source) = fold_source(with_fold)?;
+            let layer = source
+                .load_linear("model.up", &Device::Cpu, Shard::default())?
+                .unwrap();
+            let got = layer.dequantize_w()?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(got, decoded(1));
+        }
+        Ok(())
+    }
+
     const BONSAI_GGUF_ENV: &str = "BONSAI_GGUF";
     const SAMPLE_WEIGHT: &str = "blk.3.attn_k.weight";
     const TRIT_VALUES_PER_GROUP: usize = 3;
