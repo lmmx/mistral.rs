@@ -9,7 +9,7 @@ use candle_core::{
     CudaDevice, CudaStorage, DType, Device, Result, Shape, Storage, Tensor,
 };
 
-use super::{fast_mmvq::workspace_ensure, ffi, hadamard::RowTransform};
+use super::{fast_mmvq::workspace_ensure, ffi, hadamard::RowTransform, ptq1_0::PTQ1_0_BLOCK_ELEMS};
 use crate::utils::{slice_ptr_mut_on_stream, slice_ptr_on_stream};
 
 const TOKEN_CHUNK: usize = 256;
@@ -138,7 +138,8 @@ impl PackedWeights {
             .map_or(std::ptr::null(), |(p, _)| *p as *const c_void);
         let do_fwht = i32::from(self.signs.is_some());
 
-        let scratch_bytes = b_size.min(TOKEN_CHUNK) * k * size_of::<f32>();
+        let scratch_bytes =
+            b_size.min(TOKEN_CHUNK) * (k + k / PTQ1_0_BLOCK_ELEMS * size_of::<f32>());
         let mut workspace = workspace_ensure(dev, scratch_bytes, &stream)?;
         let (scratch_ptr, _scratch_guard) = workspace.ptr_mut();
 

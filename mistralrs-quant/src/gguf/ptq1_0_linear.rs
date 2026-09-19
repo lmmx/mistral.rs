@@ -93,6 +93,8 @@ impl Ptq1_0Linear {
 
 const DOT_LANES: usize = 16;
 const ROWS_PER_TASK: usize = 16;
+#[cfg(all(test, feature = "cuda"))]
+const CUDA_INT8_REL_ERR: f32 = 2e-2; // int8 activations, one scale per 128 columns
 const TOKEN_GROUP: usize = 4;
 const TOKEN_TILE: usize = 16;
 const K_TILE_BLOCKS: usize = 8;
@@ -507,13 +509,18 @@ mod tests {
                     .to_dtype(DType::F32)?
                     .flatten_all()?
                     .to_vec1::<f32>()?;
-                let tol = if dtype == DType::F32 { 2e-3 } else { 3e-2 };
-                for (g, w) in got.iter().zip(&want) {
-                    assert!(
-                        (g - w).abs() < tol * w.abs().max(1.0),
-                        "{dtype:?} in {in_dim} tokens {tokens} folded {folded}: {g} vs {w}"
-                    );
-                }
+                let norm = want.iter().map(|w| w * w).sum::<f32>().sqrt();
+                let err = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(g, w)| (g - w).powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                assert!(
+                    err / norm < CUDA_INT8_REL_ERR,
+                    "{dtype:?} in {in_dim} tokens {tokens} folded {folded}: {}",
+                    err / norm
+                );
             }
         }
         Ok(())
