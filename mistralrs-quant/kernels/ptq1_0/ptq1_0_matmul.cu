@@ -1,4 +1,5 @@
-// Prism ternary (PTQ1_0) matmul with the Hadamard weight fold applied to activations.
+// Prism ternary (PTQ1_0) matmul with the Hadamard weight fold applied to
+// activations.
 
 #include "cuda_bf16.h"
 #include "cuda_fp16.h"
@@ -9,7 +10,8 @@
 #define WARP_SIZE 32
 #define FWHT_THREADS 256
 #define MATMUL_WARPS 8
-#define MATMUL_TOKENS_PER_PASS 4
+#define MATMUL_TOKENS_PER_PASS 8
+#define MATMUL_UNROLL_BLOCKS 4
 #define FWHT_SCALE 0.03125f // 1 / sqrt(FWHT_BLOCK)
 
 static __device__ __forceinline__ float to_float(float v) { return v; }
@@ -30,7 +32,8 @@ static __device__ __forceinline__ void store_float(__nv_bfloat16 *p, float v) {
   *p = __float2bfloat16(v);
 }
 
-// One CTA per (FWHT_BLOCK columns, token). Without do_fwht it only widens to f32.
+// One CTA per (FWHT_BLOCK columns, token). Without do_fwht it only widens to
+// f32.
 template <typename T>
 static __global__ void
 ptq1_0_prepare_kernel(const T *__restrict__ x, const float *__restrict__ signs,
@@ -77,8 +80,8 @@ ptq1_0_prepare_kernel(const T *__restrict__ x, const float *__restrict__ signs,
   }
 }
 
-// One warp per output row, TT tokens per pass. Lane L owns byte L of every block, so neighbouring lanes read
-// neighbouring activations.
+// One warp per output row, TT tokens per pass. Lane L owns byte L of every
+// block, so neighbouring lanes read neighbouring activations.
 template <typename OutT, int TT>
 static __global__ void
 ptq1_0_matmul_kernel(const uint8_t *__restrict__ w, const float *__restrict__ x,
@@ -104,28 +107,30 @@ ptq1_0_matmul_kernel(const uint8_t *__restrict__ w, const float *__restrict__ x,
     acc[t] = 0.0f;
   }
 
-  for (int b = 0; b < nblk; ++b) {
+  // Loads for MATMUL_UNROLL_BLOCKS blocks are issued before any is consumed,
+  // keeping several in flight per warp.
+  int b = 0;
+  for (; b + MATMUL_UNROLL_BLOCKS <= nblk; b += MATMUL_UNROLL_BLOCKS) {
+    uint32_t bytes[MATMUL_UNROLL_BLOCKS];
+    float scales[MATMUL_UNROLL_BLOCKS];
+#pragma unroll
+    for (int u = 0; u < MATMUL_UNROLL_BLOCKS; ++u) {
+      const uint8_t *blk =
+          wrow + static_cast<size_t>(b + u) * ptq1_0::BLOCK_BYTES;
+      bytes[u] = active ? blk[lane] : 0u;
+      scales[u] = ptq1_0::block_scale(blk);
+    }
+#pragma unroll
+    for (int u = 0; u < MATMUL_UNROLL_BLOCKS; ++u) {
+      ptq1_0::accumulate_block<TT>(bytes[u], scales[u], b + u, map, active, xs,
+                                   acc);
+    }
+  }
+  for (; b < nblk; ++b) {
     const uint8_t *blk = wrow + static_cast<size_t>(b) * ptq1_0::BLOCK_BYTES;
-    if (!active) {
-      continue;
-    }
-    const float d = __half2float(__ushort_as_half(
-        *reinterpret_cast<const unsigned short *>(blk + ptq1_0::SCALE_OFFSET)));
-    uint32_t v = blk[lane];
-    const int e0 = b * ptq1_0::BLOCK_ELEMS + map.elem_base;
-    float part[TT] = {};
-    for (int n = 0; n < map.trits; ++n) {
-      const float trit = static_cast<float>(ptq1_0::next_trit(v));
-      const int e = e0 + n * map.elem_stride;
-#pragma unroll
-      for (int t = 0; t < TT; ++t) {
-        part[t] += trit * __ldg(xs[t] + e);
-      }
-    }
-#pragma unroll
-    for (int t = 0; t < TT; ++t) {
-      acc[t] += d * part[t];
-    }
+    ptq1_0::accumulate_block<TT>(active ? blk[lane] : 0u,
+                                 ptq1_0::block_scale(blk), b, map, active, xs,
+                                 acc);
   }
 
 #pragma unroll

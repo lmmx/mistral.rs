@@ -1,4 +1,5 @@
-// Index and decode math for PTQ1_0 (Prism ternary, group 128); host-compilable so it can be tested without a GPU.
+// Index and decode math for PTQ1_0 (Prism ternary, group 128); host-compilable
+// so it can be tested without a GPU.
 #pragma once
 
 #include <cstdint>
@@ -37,7 +38,8 @@ PTQ1_0_HD LaneMap lane_map(int lane) {
   return {QH_START + (lane - WIDE_LANES - NARROW_LANES), 2, 4};
 }
 
-// Next base-3 digit of a stored byte as a weight in -1..1; `v` carries the remainder.
+// Next base-3 digit of a stored byte as a weight in -1..1; `v` carries the
+// remainder.
 PTQ1_0_HD int next_trit(uint32_t &v) {
   const uint32_t p = v * 3u;
   v = p & 255u;
@@ -50,6 +52,36 @@ PTQ1_0_HD int fwht_low_index(int pair, int h) {
 }
 
 #ifdef __CUDACC__
+static __device__ __forceinline__ float block_scale(const uint8_t *blk) {
+  return __half2float(__ushort_as_half(
+      *reinterpret_cast<const unsigned short *>(blk + SCALE_OFFSET)));
+}
+
+// Adds one block's contribution for this lane; `xs` holds the TT activation
+// rows.
+template <int TT>
+static __device__ __forceinline__ void
+accumulate_block(uint32_t byte, float d, int b, const LaneMap &map, bool active,
+                 const float *const *xs, float *acc) {
+  if (!active) {
+    return;
+  }
+  const int e0 = b * BLOCK_ELEMS + map.elem_base;
+  float part[TT] = {};
+  for (int n = 0; n < map.trits; ++n) {
+    const float trit = static_cast<float>(next_trit(byte));
+    const int e = e0 + n * map.elem_stride;
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+      part[t] += trit * __ldg(xs[t] + e);
+    }
+  }
+#pragma unroll
+  for (int t = 0; t < TT; ++t) {
+    acc[t] += d * part[t];
+  }
+}
+
 static __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll
   for (int mask = 16; mask > 0; mask >>= 1) {

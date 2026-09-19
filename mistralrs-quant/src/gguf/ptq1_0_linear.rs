@@ -518,4 +518,36 @@ mod tests {
         }
         Ok(())
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a CUDA device"]
+    fn cuda_matmul_speed() -> Result<()> {
+        use crate::gguf::ptq1_0_cuda::PackedWeights;
+
+        const REPS: usize = 20;
+        let dev = Device::new_cuda(0)?;
+        let (out_dim, in_dim) = (5120, 17408);
+        let (bytes, _) = synthetic(out_dim, in_dim, 1);
+        let transform = RowTransform::fold_for_test(in_dim, 11, false);
+        let gpu = PackedWeights::upload(&bytes, Some(&transform), &dev)?;
+        for tokens in [1, 8, 59, 256] {
+            let x = vec![0.5f32; tokens * in_dim];
+            let input = Tensor::from_vec(x, (tokens, in_dim), &dev)?.to_dtype(DType::BF16)?;
+            gpu.matmul(&input, out_dim, in_dim)?;
+            dev.synchronize()?;
+            let start = Instant::now();
+            for _ in 0..REPS {
+                gpu.matmul(&input, out_dim, in_dim)?;
+            }
+            dev.synchronize()?;
+            let secs = start.elapsed().as_secs_f64() / REPS as f64;
+            let gbps = bytes.len() as f64 / secs / 1e9;
+            eprintln!(
+                "cuda tokens {tokens}: {:.3} ms, {gbps:.1} GB/s of weights",
+                secs * 1e3
+            );
+        }
+        Ok(())
+    }
 }
