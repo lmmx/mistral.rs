@@ -23,6 +23,8 @@ const SIGN_MODE_IDENTITY: &str = "identity";
 const SIGN_MODE_EXPLICIT: &str = "explicit";
 const KEY_ARCHITECTURE: &str = "general.architecture";
 const SSM_OUT_SUFFIX: &str = "ssm_out.weight";
+#[cfg(feature = "cuda")]
+const CUDA_FWHT_BLOCK: usize = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HadamardRole {
@@ -187,6 +189,49 @@ impl RowTransform {
                 }
             });
         }
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn fold_for_test(width: usize, seed: u64, permute: bool) -> Self {
+        let mut state = seed;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let signs: Vec<f32> = (0..width)
+            .map(|_| if next() % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let gather = permute.then(|| {
+            let mut order: Vec<u32> = (0..width as u32).collect();
+            for i in (1..width).rev() {
+                order.swap(i, next() as usize % (i + 1));
+            }
+            order
+        });
+        Self {
+            role: HadamardRole::Fold,
+            block: CUDA_FWHT_BLOCK,
+            signs: signs.into(),
+            gather,
+        }
+    }
+
+    /// Whether the CUDA kernels can run this transform: fold role with a 1024-wide FWHT block.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn supports_cuda(&self) -> bool {
+        self.role == HadamardRole::Fold && self.block == CUDA_FWHT_BLOCK
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn signs(&self) -> &[f32] {
+        &self.signs
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn gather(&self) -> Option<&[u32]> {
+        self.gather.as_deref()
     }
 
     pub fn apply(&self, row: &mut [f32], scratch: &mut Vec<f32>) {

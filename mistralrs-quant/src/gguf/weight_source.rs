@@ -279,7 +279,7 @@ pub struct GgufWeightSource {
     output_dtypes: HashMap<String, DType>,
     dtype: DType,
     hadamard: Option<HadamardSpec>,
-    packed_ternary_on_cpu: bool,
+    packed_ternary: bool,
 }
 
 struct PackedBinding {
@@ -345,16 +345,16 @@ impl GgufWeightSource {
             output_dtypes,
             dtype,
             hadamard,
-            packed_ternary_on_cpu: std::env::var_os(PTQ1_0_DENSE_ENV).is_none(),
+            packed_ternary: std::env::var_os(PTQ1_0_DENSE_ENV).is_none(),
         })
     }
 
     #[cfg(test)]
-    fn set_packed_ternary_on_cpu(&mut self, on: bool) {
-        self.packed_ternary_on_cpu = on;
+    fn set_packed_ternary(&mut self, on: bool) {
+        self.packed_ternary = on;
     }
 
-    /// Keeps PTQ1_0 blocks packed (fold applied to activations) for unsharded CPU linears.
+    /// Keeps PTQ1_0 blocks packed (fold applied to activations) for unsharded CPU and CUDA linears.
     fn try_load_packed_ternary(
         &self,
         key: &str,
@@ -363,8 +363,8 @@ impl GgufWeightSource {
         shard: Shard,
     ) -> Result<Option<Arc<dyn QuantMethod>>> {
         let info = self.archive.tensor_info(source_name)?;
-        if !self.packed_ternary_on_cpu
-            || !device.is_cpu()
+        if !self.packed_ternary
+            || !(device.is_cpu() || (cfg!(feature = "cuda") && device.is_cuda()))
             || info.dtype().raw() != PTQ1_0_GGUF_TYPE
             || info.shape().len() != 2
             || shard_range(shard, info.shape())?.is_some()
@@ -376,6 +376,10 @@ impl GgufWeightSource {
             Some(spec) => spec.row_transform(source_name, width)?,
             None => None,
         };
+        #[cfg(feature = "cuda")]
+        if device.is_cuda() && transform.as_ref().is_some_and(|t| !t.supports_cuda()) {
+            return Ok(None);
+        }
         let bias = self.load_bias(key, device, None, 2)?;
         let layer = Ptq1_0Linear::new(
             self.archive.clone(),
@@ -383,6 +387,7 @@ impl GgufWeightSource {
             transform,
             bias,
             self.dtype,
+            device,
         )?;
         Ok(Some(Arc::new(layer)))
     }
@@ -1626,7 +1631,7 @@ mod tests {
             .with_binding("model.up.weight", GgufTensorBinding::tensor(PLAIN_TENSOR))
             .with_binding("model.embd.weight", GgufTensorBinding::tensor(EMBD_TENSOR));
         let mut source = GgufWeightSource::new(archive, &bindings, DType::F32)?;
-        source.set_packed_ternary_on_cpu(packed);
+        source.set_packed_ternary(packed);
         Ok((file, Arc::new(source)))
     }
 
@@ -1731,7 +1736,7 @@ mod tests {
                     GgufTensorBinding::tensor("token_embd.weight"),
                 );
             let mut source = GgufWeightSource::new(archive, &bindings, DType::F32)?;
-            source.set_packed_ternary_on_cpu(packed);
+            source.set_packed_ternary(packed);
             let mut results = Vec::new();
             for (key, width) in [("m.k", 5120usize), ("m.out", 6144)] {
                 let x: Vec<f32> = (0..2 * width)

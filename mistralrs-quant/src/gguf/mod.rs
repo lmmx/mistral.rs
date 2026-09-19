@@ -13,6 +13,8 @@ mod hadamard;
 mod packed_affine;
 mod pq2_0;
 mod ptq1_0;
+#[cfg(feature = "cuda")]
+mod ptq1_0_cuda;
 pub(crate) mod ptq1_0_linear;
 mod weight_source;
 

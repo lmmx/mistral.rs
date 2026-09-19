@@ -6,6 +6,8 @@ use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Linear;
 use rayon::prelude::*;
 
+#[cfg(feature = "cuda")]
+use super::ptq1_0_cuda::PackedWeights;
 use super::{
     archive::GgufArchive,
     hadamard::RowTransform,
@@ -25,6 +27,9 @@ pub struct Ptq1_0Linear {
     transform: Option<RowTransform>,
     bias: Option<Tensor>,
     dtype: DType,
+    device: Device,
+    #[cfg(feature = "cuda")]
+    gpu: Option<PackedWeights>,
 }
 
 impl Ptq1_0Linear {
@@ -34,6 +39,7 @@ impl Ptq1_0Linear {
         transform: Option<RowTransform>,
         bias: Option<Tensor>,
         dtype: DType,
+        device: &Device,
     ) -> Result<Self> {
         let shape = archive.tensor_info(name)?.shape().to_vec();
         let &[out_dim, in_dim] = shape.as_slice() else {
@@ -41,6 +47,19 @@ impl Ptq1_0Linear {
         };
         if !in_dim.is_multiple_of(PTQ1_0_BLOCK_ELEMS) {
             candle_core::bail!("PTQ1_0 linear `{name}` width {in_dim} is not a multiple of 128");
+        }
+        #[cfg(feature = "cuda")]
+        let gpu = if device.is_cuda() {
+            let bytes = archive.tensor_data(name)?.bytes();
+            Some(PackedWeights::upload(bytes, transform.as_ref(), device)?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        if !device.is_cpu() {
+            candle_core::bail!(
+                "PTQ1_0 packed linear `{name}` needs the cuda feature for {device:?}"
+            );
         }
         Ok(Self {
             archive,
@@ -50,6 +69,9 @@ impl Ptq1_0Linear {
             transform,
             bias,
             dtype,
+            device: device.clone(),
+            #[cfg(feature = "cuda")]
+            gpu,
         })
     }
 
@@ -256,10 +278,20 @@ impl QuantMethod for Ptq1_0Linear {
         if let Some(transform) = &self.transform {
             transform.unfold_weight(&mut data);
         }
-        Tensor::from_vec(data, (self.out_dim, self.in_dim), &Device::Cpu)?.to_dtype(self.dtype)
+        Tensor::from_vec(data, (self.out_dim, self.in_dim), &Device::Cpu)?
+            .to_dtype(self.dtype)?
+            .to_device(&self.device)
     }
 
     fn forward_raw(&self, a: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(gpu) = &self.gpu {
+            let y = gpu.matmul(a, self.out_dim, self.in_dim)?;
+            return match &self.bias {
+                Some(bias) => y.broadcast_add(&bias.to_dtype(y.dtype())?),
+                None => Ok(y),
+            };
+        }
         Self::require_cpu(a)?;
         let dims = a.dims().to_vec();
         if dims.last() != Some(&self.in_dim) {
@@ -311,13 +343,13 @@ impl QuantMethod for Ptq1_0Linear {
     }
 
     fn dtype_and_device(&self) -> (DType, Device) {
-        (self.dtype, Device::Cpu)
+        (self.dtype, self.device.clone())
     }
 
     fn plan_isq(&self, request: &IsqRequest) -> Result<IsqPlanParams> {
         Ok(crate::plan_weight_isq(
             self.dtype,
-            Device::Cpu,
+            self.device.clone(),
             vec![self.out_dim, self.in_dim],
             request,
             false,
@@ -438,5 +470,52 @@ mod tests {
                 secs * 1e3
             );
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a CUDA device"]
+    fn cuda_matches_cpu_packed() -> Result<()> {
+        use crate::gguf::ptq1_0_cuda::PackedWeights;
+
+        let dev = Device::new_cuda(0)?;
+        let cases = [
+            (384, 1, false),
+            (2048, 1, true),
+            (2048, 5, false),
+            (3072, 300, true),
+        ];
+        for (in_dim, tokens, folded) in cases {
+            let out_dim = ROWS_PER_TASK * 2 + 5;
+            let (bytes, x) = synthetic(out_dim, in_dim, tokens);
+            let transform = folded.then(|| RowTransform::fold_for_test(in_dim, 11, in_dim > 2048));
+            let gpu = PackedWeights::upload(&bytes, transform.as_ref(), &dev)?;
+            for dtype in [DType::F32, DType::F16, DType::BF16] {
+                let input = Tensor::from_vec(x.clone(), (tokens, in_dim), &dev)?.to_dtype(dtype)?;
+                let rounded = input
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let mut xt = rounded.clone();
+                if let Some(transform) = &transform {
+                    xt.chunks_mut(in_dim)
+                        .for_each(|row| transform.apply(row, &mut Vec::new()));
+                }
+                let want = packed_matmul(&bytes, out_dim, in_dim, &xt, tokens);
+                let got = gpu
+                    .matmul(&input, out_dim, in_dim)?
+                    .to_dtype(DType::F32)?
+                    .flatten_all()?
+                    .to_vec1::<f32>()?;
+                let tol = if dtype == DType::F32 { 2e-3 } else { 3e-2 };
+                for (g, w) in got.iter().zip(&want) {
+                    assert!(
+                        (g - w).abs() < tol * w.abs().max(1.0),
+                        "{dtype:?} in {in_dim} tokens {tokens} folded {folded}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
