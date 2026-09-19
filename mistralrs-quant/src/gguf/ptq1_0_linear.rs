@@ -70,7 +70,10 @@ impl Ptq1_0Linear {
 }
 
 const DOT_LANES: usize = 16;
-const MIN_ROWS_PER_TASK: usize = 16;
+const ROWS_PER_TASK: usize = 16;
+const TOKEN_GROUP: usize = 4;
+const TOKEN_TILE: usize = 16;
+const K_TILE_BLOCKS: usize = 8;
 const FUSED_MAX_TOKENS: usize = 2; // above this, decoding each block once beats redoing it per token
 const QS_WIDE: usize = 16;
 const QS_NARROW: usize = 8;
@@ -79,21 +82,20 @@ const QH_START: usize = QS_NARROW_START + QS_NARROW * 5;
 
 type Lanes = [f32; DOT_LANES];
 
-/// Per-lane partial sums; reducing across lanes once per row keeps the hot loop free of serial adds.
+/// Per-lane partial sums for `T` tokens against one f32-converted block, so each weight load feeds `T` FMAs.
 #[inline(always)]
-fn block_dot(signed: &[i8; PTQ1_0_BLOCK_ELEMS], x: &[f32]) -> Lanes {
-    let mut lanes = [0f32; DOT_LANES];
-    for (s, x) in signed
-        .as_chunks::<DOT_LANES>()
-        .0
-        .iter()
-        .zip(x.as_chunks::<DOT_LANES>().0)
-    {
-        for i in 0..DOT_LANES {
-            lanes[i] += s[i] as f32 * x[i];
+fn block_dot_tokens<const T: usize>(wf: &[f32; PTQ1_0_BLOCK_ELEMS], xs: [&[f32]; T]) -> [Lanes; T] {
+    let mut acc = [[0f32; DOT_LANES]; T];
+    for (k, w) in wf.as_chunks::<DOT_LANES>().0.iter().enumerate() {
+        let at = k * DOT_LANES;
+        for t in 0..T {
+            let x = &xs[t][at..at + DOT_LANES];
+            for i in 0..DOT_LANES {
+                acc[t][i] += w[i] * x[i];
+            }
         }
     }
-    lanes
+    acc
 }
 
 /// Unscaled dot of one packed block with `x`, decoding trits in lanes across the stage bytes.
@@ -126,30 +128,70 @@ struct RowJob<'a> {
     xt: &'a [f32],
 }
 
+/// Accumulates `acc` (`rows x tokens`) for a chunk of weight rows, tiling so activations stay in L2.
 #[inline(always)]
-fn matmul_row(lanes: &mut [Lanes], acc: &mut [f32], row: &[u8], job: &RowJob) {
-    lanes.fill([0f32; DOT_LANES]);
-    let blocks = row.as_chunks::<PTQ1_0_BLOCK_BYTES>().0;
-    if job.tokens <= FUSED_MAX_TOKENS {
-        acc.fill(0.0);
-        for (b, block) in blocks.iter().enumerate() {
-            let d = super::ptq1_0::block_scale(block);
-            for (t, a) in acc.iter_mut().enumerate() {
-                let start = t * job.in_dim + b * PTQ1_0_BLOCK_ELEMS;
-                *a += d * block_dot_fused(block, &job.xt[start..start + PTQ1_0_BLOCK_ELEMS]);
+fn matmul_rows(lanes: &mut Vec<Lanes>, acc: &mut [f32], bytes: &[u8], job: &RowJob) {
+    let tokens = job.tokens;
+    let blocks_per_row = job.in_dim / PTQ1_0_BLOCK_ELEMS;
+    let row_bytes = blocks_per_row * PTQ1_0_BLOCK_BYTES;
+    let rows = acc.len() / tokens;
+    if tokens <= FUSED_MAX_TOKENS {
+        for (acc, row) in acc.chunks_mut(tokens).zip(bytes.chunks(row_bytes)) {
+            acc.fill(0.0);
+            for (b, block) in row.as_chunks::<PTQ1_0_BLOCK_BYTES>().0.iter().enumerate() {
+                let d = super::ptq1_0::block_scale(block);
+                for (t, a) in acc.iter_mut().enumerate() {
+                    let start = t * job.in_dim + b * PTQ1_0_BLOCK_ELEMS;
+                    *a += d * block_dot_fused(block, &job.xt[start..start + PTQ1_0_BLOCK_ELEMS]);
+                }
             }
         }
         return;
     }
-    let mut signed = [0i8; PTQ1_0_BLOCK_ELEMS];
-    for (b, block) in blocks.iter().enumerate() {
-        unpack_block_signed(block, &mut signed);
-        let d = super::ptq1_0::block_scale(block);
-        for (t, l) in lanes.iter_mut().enumerate() {
-            let start = t * job.in_dim + b * PTQ1_0_BLOCK_ELEMS;
-            let part = block_dot(&signed, &job.xt[start..start + PTQ1_0_BLOCK_ELEMS]);
-            for (l, p) in l.iter_mut().zip(part) {
-                *l += d * p;
+    lanes.clear();
+    lanes.resize(rows * tokens, [0f32; DOT_LANES]);
+    let mut tile = vec![[0i8; PTQ1_0_BLOCK_ELEMS]; rows * K_TILE_BLOCKS];
+    let mut scales = vec![0f32; rows * K_TILE_BLOCKS];
+    for k0 in (0..blocks_per_row).step_by(K_TILE_BLOCKS) {
+        let kn = K_TILE_BLOCKS.min(blocks_per_row - k0);
+        for r in 0..rows {
+            let row = &bytes[r * row_bytes..(r + 1) * row_bytes];
+            let blocks = &row.as_chunks::<PTQ1_0_BLOCK_BYTES>().0[k0..k0 + kn];
+            for (j, block) in blocks.iter().enumerate() {
+                unpack_block_signed(block, &mut tile[r * K_TILE_BLOCKS + j]);
+                scales[r * K_TILE_BLOCKS + j] = super::ptq1_0::block_scale(block);
+            }
+        }
+        for t0 in (0..tokens).step_by(TOKEN_TILE) {
+            let t_end = (t0 + TOKEN_TILE).min(tokens);
+            for r in 0..rows {
+                for j in 0..kn {
+                    let wf = tile[r * K_TILE_BLOCKS + j].map(|s| s as f32);
+                    let d = scales[r * K_TILE_BLOCKS + j];
+                    let at = (k0 + j) * PTQ1_0_BLOCK_ELEMS;
+                    let x_of = |t: usize| {
+                        let start = t * job.in_dim + at;
+                        &job.xt[start..start + PTQ1_0_BLOCK_ELEMS]
+                    };
+                    let row_lanes = &mut lanes[r * tokens..(r + 1) * tokens];
+                    let mut t = t0;
+                    while t + TOKEN_GROUP <= t_end {
+                        let xs = std::array::from_fn(|i| x_of(t + i));
+                        let part = block_dot_tokens::<TOKEN_GROUP>(&wf, xs);
+                        for (l, p) in row_lanes[t..t + TOKEN_GROUP].iter_mut().zip(part) {
+                            for (l, p) in l.iter_mut().zip(p) {
+                                *l += d * p;
+                            }
+                        }
+                        t += TOKEN_GROUP;
+                    }
+                    for (i, l) in row_lanes[t..t_end].iter_mut().enumerate() {
+                        let [part] = block_dot_tokens::<1>(&wf, [x_of(t + i)]);
+                        for (l, p) in l.iter_mut().zip(part) {
+                            *l += d * p;
+                        }
+                    }
+                }
             }
         }
     }
@@ -160,8 +202,8 @@ fn matmul_row(lanes: &mut [Lanes], acc: &mut [f32], row: &[u8], job: &RowJob) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn matmul_row_avx2(lanes: &mut [Lanes], acc: &mut [f32], row: &[u8], job: &RowJob) {
-    matmul_row(lanes, acc, row, job)
+unsafe fn matmul_rows_avx2(lanes: &mut Vec<Lanes>, acc: &mut [f32], bytes: &[u8], job: &RowJob) {
+    matmul_rows(lanes, acc, bytes, job)
 }
 
 /// Returns `[tokens, out_dim]` for already-transformed activations `xt` of shape `[tokens, in_dim]`.
@@ -175,23 +217,19 @@ fn packed_matmul(
     let row_bytes = in_dim / PTQ1_0_BLOCK_ELEMS * PTQ1_0_BLOCK_BYTES;
     #[cfg(target_arch = "x86_64")]
     let avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+    let job = RowJob { in_dim, tokens, xt };
     let mut by_row = vec![0f32; out_dim * tokens];
     by_row
-        .par_chunks_mut(tokens)
-        .zip(bytes.par_chunks(row_bytes))
-        .with_min_len(MIN_ROWS_PER_TASK)
-        .for_each_init(
-            || vec![[0f32; DOT_LANES]; tokens],
-            |lanes, (acc, row)| {
-                let job = RowJob { in_dim, tokens, xt };
-                #[cfg(target_arch = "x86_64")]
-                if avx2 {
-                    // SAFETY: avx2 and fma were detected at runtime above
-                    return unsafe { matmul_row_avx2(lanes, acc, row, &job) };
-                }
-                matmul_row(lanes, acc, row, &job)
-            },
-        );
+        .par_chunks_mut(ROWS_PER_TASK * tokens)
+        .zip(bytes.par_chunks(ROWS_PER_TASK * row_bytes))
+        .for_each_init(Vec::new, |lanes, (acc, rows)| {
+            #[cfg(target_arch = "x86_64")]
+            if avx2 {
+                // SAFETY: avx2 and fma were detected at runtime above
+                return unsafe { matmul_rows_avx2(lanes, acc, rows, &job) };
+            }
+            matmul_rows(lanes, acc, rows, &job)
+        });
     let mut out = vec![0f32; tokens * out_dim];
     for (r, col) in by_row.chunks_exact(tokens).enumerate() {
         for (t, v) in col.iter().enumerate() {
@@ -351,13 +389,16 @@ mod tests {
 
     #[test]
     fn packed_matmul_matches_dequantized_dense() {
-        for tokens in [1, FUSED_MAX_TOKENS + 1] {
-            check_against_dense(tokens);
+        let wide = (K_TILE_BLOCKS + 3) * PTQ1_0_BLOCK_ELEMS;
+        for in_dim in [3 * PTQ1_0_BLOCK_ELEMS, wide] {
+            for tokens in [1, FUSED_MAX_TOKENS + 1, TOKEN_TILE + TOKEN_GROUP + 1] {
+                check_against_dense(in_dim, tokens);
+            }
         }
     }
 
-    fn check_against_dense(tokens: usize) {
-        let (out_dim, in_dim) = (37, 384);
+    fn check_against_dense(in_dim: usize, tokens: usize) {
+        let out_dim = ROWS_PER_TASK * 2 + 5;
         let (bytes, x) = synthetic(out_dim, in_dim, tokens);
         let mut w = vec![0f32; out_dim * in_dim];
         w.chunks_mut(in_dim)
@@ -381,7 +422,7 @@ mod tests {
     #[test]
     #[ignore = "timing"]
     fn packed_matmul_speed() {
-        for tokens in [1, 2, 3, 16] {
+        for tokens in [1, 16, 64, 256] {
             let (out_dim, in_dim) = (5120, 17408);
             let (bytes, x) = synthetic(out_dim, in_dim, tokens);
             packed_matmul(&bytes, out_dim, in_dim, &x, tokens);
