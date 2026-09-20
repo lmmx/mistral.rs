@@ -582,7 +582,7 @@ mod tests {
 
         const REPS: usize = 50;
         const VARIANT_REL_ERR: f32 = 5e-3;
-        const VARIANTS: [&str; 2] = ["lanes", "bpl"];
+        const VARIANTS: [(&str, i32); 3] = [("lanes", 0), ("bpl", 1), ("bpl smem", 4)];
         let dev = Device::new_cuda(0)?;
         let time = |f: &dyn Fn() -> Result<Tensor>| -> Result<f64> {
             f()?;
@@ -595,7 +595,10 @@ mod tests {
             Ok(start.elapsed().as_secs_f64() / REPS as f64)
         };
 
-        eprintln!("1 token, GB/s of weights; variants {VARIANTS:?}");
+        eprintln!(
+            "1 token, GB/s of weights; variants {:?}",
+            VARIANTS.map(|v| v.0)
+        );
         let shapes = [
             (17408, 5120, "ffn gate/up"),
             (5120, 17408, "ffn down"),
@@ -617,7 +620,7 @@ mod tests {
             let baseline = floats(gpu.matmul_variant(&input, out_dim, 0)?)?;
             let norm = baseline.iter().map(|v| v * v).sum::<f32>().sqrt();
             let mut row = Vec::new();
-            for variant in 0..VARIANTS.len() as i32 {
+            for (_, variant) in VARIANTS {
                 let got = floats(gpu.matmul_variant(&input, out_dim, variant)?)?;
                 let err = got
                     .iter()

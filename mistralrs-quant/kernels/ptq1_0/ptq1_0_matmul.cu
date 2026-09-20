@@ -17,6 +17,9 @@
 #define BPL_LANES_PER_ROW 8 // K / 128 is a multiple of 8 for folded weights
 #define BPL_ROWS_PER_WARP (WARP_SIZE / BPL_LANES_PER_ROW)
 #define BPL_MAX_TOKENS 4 // beyond this the lane kernel is faster
+#define BPL_X_PITCH 9 // int4 per staged block: 8 data + 1 pad, so 8 lanes on
+                      // different blocks read distinct banks
+#define BPL_X_SMEM_MAX (48 * 1024)
 #define SCALE_WORD (ptq1_0::BLOCK_WORDS - 1) // scale is in its top half
 #define FWHT_SCALE 0.03125f    // 1 / sqrt(FWHT_BLOCK)
 #define INT8_MAX_F 127.0f
@@ -125,7 +128,7 @@ ptq1_0_prepare_kernel(const T *__restrict__ x, const float *__restrict__ signs,
 // so a warp step loads 112 contiguous bytes.
 // One thread per weight block, BPL_LANES_PER_ROW lanes per row: straight-line
 // decode of all 128 weights and vector loads of the activations.
-template <typename OutT, int TT>
+template <typename OutT, int TT, bool XSMEM>
 static __global__ void
 ptq1_0_matmul_bpl_kernel(const uint32_t *__restrict__ w,
                          const int8_t *__restrict__ xq,
@@ -157,6 +160,35 @@ ptq1_0_matmul_bpl_kernel(const uint32_t *__restrict__ w,
     acc[t] = 0.0f;
   }
 
+  extern __shared__ int4 x_stage[];
+  if (XSMEM) {
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+      int4 *dst = x_stage + static_cast<size_t>(t) * nblk * BPL_X_PITCH;
+      for (int c = threadIdx.x; c < nblk * 8; c += blockDim.x) {
+        dst[(c >> 3) * BPL_X_PITCH + (c & 7)] = __ldg(x16[t] + c);
+      }
+    }
+    __syncthreads();
+  }
+  // Activation words for block b: 16 bytes at index n of 8, or 8 bytes at
+  // index u of 16.
+  auto load16 = [&](int t, int b, int n) -> int4 {
+    if (XSMEM) {
+      return x_stage[static_cast<size_t>(t) * nblk * BPL_X_PITCH +
+                     b * BPL_X_PITCH + n];
+    }
+    return __ldg(x16[t] + b * 8 + n);
+  };
+  auto load8 = [&](int t, int b, int u) -> int2 {
+    if (XSMEM) {
+      const int4 v = x_stage[static_cast<size_t>(t) * nblk * BPL_X_PITCH +
+                             b * BPL_X_PITCH + (u >> 1)];
+      return (u & 1) ? make_int2(v.z, v.w) : make_int2(v.x, v.y);
+    }
+    return __ldg(x8[t] + b * 16 + u);
+  };
+
   for (int b = sub; b < nblk; b += BPL_LANES_PER_ROW) {
     uint32_t wd[ptq1_0::BLOCK_WORDS];
 #pragma unroll
@@ -181,7 +213,7 @@ ptq1_0_matmul_bpl_kernel(const uint32_t *__restrict__ w,
       }
 #pragma unroll
       for (int t = 0; t < TT; ++t) {
-        const int4 xv = __ldg(x16[t] + b * 8 + n);
+        const int4 xv = load16(t, b, n);
         isum[t] = ptq1_0::dot4(q[0], xv.x, isum[t]);
         isum[t] = ptq1_0::dot4(q[1], xv.y, isum[t]);
         isum[t] = ptq1_0::dot4(q[2], xv.z, isum[t]);
@@ -203,7 +235,7 @@ ptq1_0_matmul_bpl_kernel(const uint32_t *__restrict__ w,
       }
 #pragma unroll
       for (int t = 0; t < TT; ++t) {
-        const int2 xv = __ldg(x8[t] + b * 16 + 10 + n);
+        const int2 xv = load8(t, b, 10 + n);
         isum[t] = ptq1_0::dot4(q[0], xv.x, isum[t]);
         isum[t] = ptq1_0::dot4(q[1], xv.y, isum[t]);
       }
@@ -223,7 +255,7 @@ ptq1_0_matmul_bpl_kernel(const uint32_t *__restrict__ w,
         ptq1_0::byte_perm(w1_lo, w1_hi, 0x7531), ptq1_0::ONES));
 #pragma unroll
     for (int t = 0; t < TT; ++t) {
-      const int2 xv = __ldg(x8[t] + b * 16 + 15);
+      const int2 xv = load8(t, b, 15);
       isum[t] = ptq1_0::dot4(qa, xv.x, isum[t]);
       isum[t] = ptq1_0::dot4(qb, xv.y, isum[t]);
     }
@@ -386,7 +418,7 @@ static void ptq1_0_launch_lanes(const void *x, const void *w,
   }
 }
 
-template <typename T, int TT>
+template <typename T, int TT, bool XSMEM>
 static void ptq1_0_launch_bpl(const void *x, const void *w, const void *signs,
                               const void *gather, void *scratch, void *dst,
                               int ncols_x, int nrows_x, int b_size,
@@ -401,9 +433,14 @@ static void ptq1_0_launch_bpl(const void *x, const void *w, const void *signs,
   const int rows_per_cta = MATMUL_WARPS * BPL_ROWS_PER_WARP;
   const unsigned int row_blocks = (nrows_x + rows_per_cta - 1) / rows_per_cta;
   const unsigned int passes = (b_size + TT - 1) / TT;
-  ptq1_0_matmul_bpl_kernel<T, TT><<<dim3(row_blocks, passes, 1), block, 0, s>>>(
-      static_cast<const uint32_t *>(w), xq, xscale, static_cast<T *>(dst),
-      ncols_x, nrows_x, b_size);
+  const size_t smem = XSMEM ? static_cast<size_t>(TT) *
+                                  (ncols_x / ptq1_0::BLOCK_ELEMS) *
+                                  BPL_X_PITCH * sizeof(int4)
+                            : 0;
+  ptq1_0_matmul_bpl_kernel<T, TT, XSMEM>
+      <<<dim3(row_blocks, passes, 1), block, smem, s>>>(
+          static_cast<const uint32_t *>(w), xq, xscale, static_cast<T *>(dst),
+          ncols_x, nrows_x, b_size);
 }
 
 // The thread-per-block kernel, one token per pass, wins up to a few tokens;
@@ -414,8 +451,8 @@ static void ptq1_0_launch(const void *x, const void *w, const void *signs,
                           int ncols_x, int nrows_x, int b_size, int do_fwht,
                           void *stream) {
   if (b_size <= BPL_MAX_TOKENS) {
-    ptq1_0_launch_bpl<T, 1>(x, w, signs, gather, scratch, dst, ncols_x,
-                            nrows_x, b_size, do_fwht, stream);
+    ptq1_0_launch_bpl<T, 1, false>(x, w, signs, gather, scratch, dst, ncols_x,
+                                   nrows_x, b_size, do_fwht, stream);
   } else {
     ptq1_0_launch_lanes<T>(x, w, signs, gather, scratch, dst, ncols_x, nrows_x,
                            b_size, do_fwht, stream);
@@ -487,7 +524,8 @@ PTQ1_0_EMBEDDING_LAUNCHER(f16, __half)
 PTQ1_0_EMBEDDING_LAUNCHER(bf16, __nv_bfloat16)
 
 // Benchmark entry: 0 lane-role kernel, 1/2/3 thread-per-block with 1/2/4
-// tokens per pass, anything else the production dispatch.
+// tokens per pass, 4 the same with activations staged in shared memory (1 token
+// per pass); anything else the production dispatch.
 extern "C" void launch_ptq1_0_matmul_variant_bf16(
     const void *x, const void *w, const void *signs, const void *gather,
     void *scratch, void *dst, int ncols_x, int nrows_x, int b_size,
@@ -499,19 +537,24 @@ extern "C" void launch_ptq1_0_matmul_variant_bf16(
                                        stream);
     break;
   case 1:
-    ptq1_0_launch_bpl<__nv_bfloat16, 1>(x, w, signs, gather, scratch, dst,
-                                        ncols_x, nrows_x, b_size, do_fwht,
-                                        stream);
+    ptq1_0_launch_bpl<__nv_bfloat16, 1, false>(
+        x, w, signs, gather, scratch, dst, ncols_x, nrows_x, b_size, do_fwht,
+        stream);
     break;
   case 2:
-    ptq1_0_launch_bpl<__nv_bfloat16, 2>(x, w, signs, gather, scratch, dst,
-                                        ncols_x, nrows_x, b_size, do_fwht,
-                                        stream);
+    ptq1_0_launch_bpl<__nv_bfloat16, 2, false>(
+        x, w, signs, gather, scratch, dst, ncols_x, nrows_x, b_size, do_fwht,
+        stream);
     break;
   case 3:
-    ptq1_0_launch_bpl<__nv_bfloat16, 4>(x, w, signs, gather, scratch, dst,
-                                        ncols_x, nrows_x, b_size, do_fwht,
-                                        stream);
+    ptq1_0_launch_bpl<__nv_bfloat16, 4, false>(
+        x, w, signs, gather, scratch, dst, ncols_x, nrows_x, b_size, do_fwht,
+        stream);
+    break;
+  case 4:
+    ptq1_0_launch_bpl<__nv_bfloat16, 1, true>(
+        x, w, signs, gather, scratch, dst, ncols_x, nrows_x, b_size, do_fwht,
+        stream);
     break;
   default:
     ptq1_0_launch<__nv_bfloat16>(x, w, signs, gather, scratch, dst, ncols_x,
