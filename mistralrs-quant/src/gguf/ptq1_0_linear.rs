@@ -493,6 +493,7 @@ mod tests {
             (2048, 3, true),
             (2048, 4, false),
             (2048, 5, false),
+            (2048, 12, false),
             (2048, 40, true),
             (3072, 300, true),
         ];
@@ -675,6 +676,23 @@ mod tests {
                 let input = Tensor::from_vec(x, (tokens, in_dim), &dev)?.to_dtype(DType::BF16)?;
                 let lanes = time(&|| gpu.matmul_variant(&input, out_dim, 0))?;
                 let gemm = time(&|| gpu.matmul_variant(&input, out_dim, 5))?;
+                let floats = |t: Tensor| -> Result<Vec<f32>> {
+                    t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+                };
+                let want = floats(gpu.matmul_variant(&input, out_dim, 0)?)?;
+                let got = floats(gpu.matmul_variant(&input, out_dim, 5)?)?;
+                let norm = want.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let err = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(g, w)| (g - w).powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                assert!(
+                    err <= CUDA_INT8_REL_ERR * norm,
+                    "gemm differs from the lane kernel at {tokens} tokens: {}",
+                    err / norm
+                );
                 eprintln!(
                     "{out_dim:>6} x {in_dim:<5} tokens {tokens:>3}: {:7.3} | {:7.3}  ({:.1}x)",
                     lanes * 1e3,

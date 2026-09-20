@@ -14,7 +14,7 @@
 #define BLOCKS_PER_WARP_STEP 4 // 4 blocks x 7 words fill 28 of 32 lanes
 #define BPL_LANES_PER_ROW 8 // K / 128 is a multiple of 8 for folded weights
 #define BPL_ROWS_PER_WARP (WARP_SIZE / BPL_LANES_PER_ROW)
-#define BPL_MAX_TOKENS 4 // beyond this the lane kernel is faster
+#define BPL_MAX_TOKENS 15 // from 16 tokens the tensor-core GEMM takes over
 #define BPL_X_PITCH 9 // int4 per staged block: 8 data + 1 pad, so 8 lanes on
                       // different blocks read distinct banks
 #define BPL_X_SMEM_MAX (48 * 1024)
@@ -400,9 +400,9 @@ static void ptq1_0_launch_bpl(const void *x, const void *w, const void *signs,
           ncols_x, nrows_x, b_size);
 }
 
-// The thread-per-block kernel, one token per pass, wins up to a few tokens;
-// beyond that the lane kernel amortizes the weight decode better. Activations
-// are staged in shared memory when the row fits.
+// The thread-per-block kernel, one token per pass, wins for small batches;
+// the lane kernel is only the fallback for larger ones on GPUs without the
+// tensor-core GEMM. Activations are staged in shared memory when the row fits.
 template <typename T>
 static void ptq1_0_launch(const void *x, const void *w, const void *signs,
                           const void *gather, void *scratch, void *dst,

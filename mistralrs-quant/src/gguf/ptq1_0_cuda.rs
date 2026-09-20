@@ -13,7 +13,7 @@ use super::{fast_mmvq::workspace_ensure, ffi, hadamard::RowTransform, ptq1_0::PT
 use crate::utils::{slice_ptr_mut_on_stream, slice_ptr_on_stream};
 
 const TOKEN_CHUNK: usize = 256;
-const GEMM_MIN_TOKENS: usize = 32;
+const GEMM_MIN_TOKENS: usize = 16;
 #[cfg(test)]
 const GEMM_VARIANT: i32 = 5;
 
