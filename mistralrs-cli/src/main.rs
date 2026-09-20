@@ -30,8 +30,26 @@ use mistralrs_core::{initialize_mistralrs_logging, LogVerbosity};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+const RAYON_THREADS_ENV: &str = "RAYON_NUM_THREADS";
+const POOL_SPIN_ENV: &str = "CANDLE_BARRIER_POOL_SPIN_LIMIT";
+const POOL_SPIN_LIMIT: &str = "1";
+
+/// Candle sizes its pools to physical cores and spins between ops, which idles hyperthreads and steals matmul cycles.
+fn set_cpu_thread_defaults() {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    for (key, value) in [
+        (RAYON_THREADS_ENV, threads.to_string()),
+        (POOL_SPIN_ENV, POOL_SPIN_LIMIT.to_string()),
+    ] {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    set_cpu_thread_defaults();
     candle_core::utils::init_global_threadpool();
     let cli = Cli::parse();
     init_tracing(cli.global.verbose);
