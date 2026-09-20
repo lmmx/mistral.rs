@@ -204,6 +204,9 @@ struct Scratch {
     tile: Vec<Elems<u8>>,
     scales: Vec<f32>,
     acc: Vec<[f32; LANES]>,
+    corr: Vec<[f32; K_TILE_BLOCKS]>,
+    xscales: Vec<[f32; K_TILE_BLOCKS]>,
+    xsums: Vec<[f32; K_TILE_BLOCKS]>,
 }
 
 impl Scratch {
@@ -212,6 +215,9 @@ impl Scratch {
             tile: Vec::new(),
             scales: Vec::new(),
             acc: Vec::new(),
+            corr: Vec::new(),
+            xscales: Vec::new(),
+            xsums: Vec::new(),
         }
     }
 }
@@ -223,6 +229,8 @@ struct TileCtx<'a> {
     acts: &'a Acts,
     k0: usize,
     kn: usize,
+    xscales: &'a [[f32; K_TILE_BLOCKS]],
+    xsums: &'a [[f32; K_TILE_BLOCKS]],
     token_base: usize,
     token_width: usize,
 }
@@ -237,6 +245,7 @@ fn reduce(lanes: &[f32; LANES]) -> f32 {
 unsafe fn micro<K: Int8Kernel, const R: usize, const T: usize>(
     cx: &TileCtx,
     acc: &mut [[f32; LANES]],
+    corr: &mut [[f32; K_TILE_BLOCKS]],
     (r0, t0): (usize, usize),
 ) {
     let at = |r: usize, i: usize| (r0 + r) * cx.token_width + t0 + i;
@@ -248,17 +257,26 @@ unsafe fn micro<K: Int8Kernel, const R: usize, const T: usize>(
         let start = (r0 + r) * K_TILE_BLOCKS;
         &cx.tile[start..start + kn]
     });
-    let wscales: [&[f32]; R] = std::array::from_fn(|r| {
-        let start = (r0 + r) * K_TILE_BLOCKS;
-        &cx.scales[start..start + kn]
-    });
     let span = |i: usize| {
         let start = (cx.token_base + t0 + i) * bpr + cx.k0;
         start..start + kn
     };
     let xq: [&[Elems<i8>]; T] = std::array::from_fn(|i| &cx.acts.q[span(i)]);
-    let xscales: [&[f32]; T] = std::array::from_fn(|i| &cx.acts.scales[span(i)]);
-    let xsums: [&[i32]; T] = std::array::from_fn(|i| &cx.acts.sums[span(i)]);
+    let mut scales = [[[0f32; K_TILE_BLOCKS]; T]; R];
+    for r in 0..R {
+        let start = (r0 + r) * K_TILE_BLOCKS;
+        let ws = &cx.scales[start..start + K_TILE_BLOCKS];
+        for i in 0..T {
+            let (xs, xsum) = (&cx.xscales[t0 + i], &cx.xsums[t0 + i]);
+            let c = &mut corr[at(r, i)];
+            for j in 0..K_TILE_BLOCKS {
+                let scale = ws[j] * xs[j];
+                scales[r][i][j] = scale;
+                // (t - 1) * x = t * x - x, so the sum term is collected per tile and subtracted from the row total
+                c[j] = scale.mul_add(xsum[j], c[j]);
+            }
+        }
+    }
     for j in 0..kn {
         let dots = K::dot::<R, T>(
             std::array::from_fn(|r| &ts[r][j]),
@@ -266,11 +284,8 @@ unsafe fn micro<K: Int8Kernel, const R: usize, const T: usize>(
         );
         for r in 0..R {
             for i in 0..T {
-                let scale = wscales[r][j] * xscales[i][j];
-                let mut lanes = dots[r][i];
-                lanes[0] -= xsums[i][j]; // (t - 1) * x = t * x - x
                 for l in 0..LANES {
-                    a[r][i][l] = scale.mul_add(lanes[l] as f32, a[r][i][l]);
+                    a[r][i][l] = scales[r][i][j].mul_add(dots[r][i][l] as f32, a[r][i][l]);
                 }
             }
         }
@@ -301,6 +316,8 @@ unsafe fn matmul_rows<K: Int8Kernel>(
         let width = TOKEN_TILE.min(tokens - token_base);
         sc.acc.clear();
         sc.acc.resize(rows * width, [0.0; LANES]);
+        sc.corr.clear();
+        sc.corr.resize(rows * width, [0.0; K_TILE_BLOCKS]);
         for k0 in (0..bpr).step_by(K_TILE_BLOCKS) {
             let kn = K_TILE_BLOCKS.min(bpr - k0);
             for r in 0..rows {
@@ -313,10 +330,23 @@ unsafe fn matmul_rows<K: Int8Kernel>(
                     sc.scales[r * K_TILE_BLOCKS + j] = block_scale(block);
                 }
             }
+            sc.xscales.clear();
+            sc.xscales.resize(width, [0.0; K_TILE_BLOCKS]);
+            sc.xsums.clear();
+            sc.xsums.resize(width, [0.0; K_TILE_BLOCKS]);
+            for t in 0..width {
+                let start = (token_base + t) * bpr + k0;
+                for j in 0..kn {
+                    sc.xscales[t][j] = acts.scales[start + j];
+                    sc.xsums[t][j] = acts.sums[start + j] as f32;
+                }
+            }
             let cx = TileCtx {
                 tile: &sc.tile,
                 scales: &sc.scales,
                 acts,
+                xscales: &sc.xscales,
+                xsums: &sc.xsums,
                 k0,
                 kn,
                 token_base,
@@ -335,11 +365,15 @@ unsafe fn matmul_rows<K: Int8Kernel>(
                     let at = (r, t);
                     match (rb, tb) {
                         (ROW_BLOCK, TOKEN_BLOCK) => {
-                            micro::<K, ROW_BLOCK, TOKEN_BLOCK>(&cx, &mut sc.acc, at)
+                            micro::<K, ROW_BLOCK, TOKEN_BLOCK>(&cx, &mut sc.acc, &mut sc.corr, at)
                         }
-                        (ROW_BLOCK, _) => micro::<K, ROW_BLOCK, 1>(&cx, &mut sc.acc, at),
-                        (_, TOKEN_BLOCK) => micro::<K, 1, TOKEN_BLOCK>(&cx, &mut sc.acc, at),
-                        _ => micro::<K, 1, 1>(&cx, &mut sc.acc, at),
+                        (ROW_BLOCK, _) => {
+                            micro::<K, ROW_BLOCK, 1>(&cx, &mut sc.acc, &mut sc.corr, at)
+                        }
+                        (_, TOKEN_BLOCK) => {
+                            micro::<K, 1, TOKEN_BLOCK>(&cx, &mut sc.acc, &mut sc.corr, at)
+                        }
+                        _ => micro::<K, 1, 1>(&cx, &mut sc.acc, &mut sc.corr, at),
                     }
                     t += tb;
                 }
@@ -348,7 +382,8 @@ unsafe fn matmul_rows<K: Int8Kernel>(
         }
         for r in 0..rows {
             for t in 0..width {
-                out[r * tokens + token_base + t] = reduce(&sc.acc[r * width + t]);
+                out[r * tokens + token_base + t] =
+                    reduce(&sc.acc[r * width + t]) - sc.corr[r * width + t].iter().sum::<f32>();
             }
         }
     }
