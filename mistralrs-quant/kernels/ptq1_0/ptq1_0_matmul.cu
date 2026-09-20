@@ -444,18 +444,26 @@ static void ptq1_0_launch_bpl(const void *x, const void *w, const void *signs,
 }
 
 // The thread-per-block kernel, one token per pass, wins up to a few tokens;
-// beyond that the lane kernel amortizes the weight decode better.
+// beyond that the lane kernel amortizes the weight decode better. Activations
+// are staged in shared memory when the row fits.
 template <typename T>
 static void ptq1_0_launch(const void *x, const void *w, const void *signs,
                           const void *gather, void *scratch, void *dst,
                           int ncols_x, int nrows_x, int b_size, int do_fwht,
                           void *stream) {
-  if (b_size <= BPL_MAX_TOKENS) {
-    ptq1_0_launch_bpl<T, 1, false>(x, w, signs, gather, scratch, dst, ncols_x,
-                                   nrows_x, b_size, do_fwht, stream);
-  } else {
+  if (b_size > BPL_MAX_TOKENS) {
     ptq1_0_launch_lanes<T>(x, w, signs, gather, scratch, dst, ncols_x, nrows_x,
                            b_size, do_fwht, stream);
+    return;
+  }
+  const size_t stage_bytes = static_cast<size_t>(ncols_x) /
+                             ptq1_0::BLOCK_ELEMS * BPL_X_PITCH * sizeof(int4);
+  if (stage_bytes <= BPL_X_SMEM_MAX) {
+    ptq1_0_launch_bpl<T, 1, true>(x, w, signs, gather, scratch, dst, ncols_x,
+                                  nrows_x, b_size, do_fwht, stream);
+  } else {
+    ptq1_0_launch_bpl<T, 1, false>(x, w, signs, gather, scratch, dst, ncols_x,
+                                   nrows_x, b_size, do_fwht, stream);
   }
 }
 

@@ -644,7 +644,7 @@ mod tests {
             );
         }
 
-        eprintln!("token sweep, ms per matmul; lanes | bpl 1 token per pass | bpl 2 | bpl 4");
+        eprintln!("token sweep, ms per matmul; lanes | bpl 1 token per pass | bpl 2 | bpl smem 1");
         for (out_dim, in_dim) in [(17408, 5120), (5120, 17408)] {
             let (bytes, _) = synthetic(out_dim, in_dim, 1);
             let transform = RowTransform::for_test(HadamardRole::Fold, in_dim, 11, false);
@@ -653,7 +653,7 @@ mod tests {
                 let x = vec![0.5f32; tokens * in_dim];
                 let input = Tensor::from_vec(x, (tokens, in_dim), &dev)?.to_dtype(DType::BF16)?;
                 let mut cells = Vec::new();
-                for variant in 0..4 {
+                for variant in [0, 1, 2, 4] {
                     let secs = time(&|| gpu.matmul_variant(&input, out_dim, variant))?;
                     cells.push(format!("{:6.3}", secs * 1e3));
                 }
