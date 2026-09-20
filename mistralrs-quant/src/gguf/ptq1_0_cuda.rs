@@ -259,7 +259,7 @@ impl PackedWeights {
         )))
     }
 
-    /// Benchmark-only: bf16 input through one of the kernel variants (prefetch depth, digit decode).
+    /// Benchmark-only: bf16 input through the lane-role (0) or production (1) kernel.
     #[cfg(test)]
     pub(crate) fn matmul_variant(&self, xs: &Tensor, nrows: usize, variant: i32) -> Result<Tensor> {
         let Device::Cuda(dev) = xs.device() else {
@@ -283,7 +283,7 @@ impl PackedWeights {
             .map_or(std::ptr::null(), |(p, _)| *p as *const c_void);
 
         let groups = k / PTQ1_0_BLOCK_ELEMS;
-        let scratch_bytes = b_size * (k + 2 * groups * size_of::<f32>());
+        let scratch_bytes = b_size * (k + groups * size_of::<f32>());
         let mut workspace = workspace_ensure(dev, scratch_bytes, &stream)?;
         let (scratch_ptr, _scratch_guard) = workspace.ptr_mut();
         let mut out = unsafe { dev.alloc::<half::bf16>(b_size * nrows)? };

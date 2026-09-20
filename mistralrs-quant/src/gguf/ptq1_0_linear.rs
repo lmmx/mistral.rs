@@ -579,8 +579,7 @@ mod tests {
         use crate::gguf::ptq1_0_cuda::PackedWeights;
 
         const REPS: usize = 50;
-        const UNSIGNED_FROM: i32 = 3;
-        const UNSIGNED_REL_ERR: f32 = 5e-3;
+        const VARIANT_REL_ERR: f32 = 5e-3;
         const VARIANTS: [&str; 8] = [
             "pf2", "pf4", "pf8", "pf2 u", "pf4 u", "pf8 u", "bpl", "bpl u",
         ];
@@ -596,7 +595,7 @@ mod tests {
             Ok(start.elapsed().as_secs_f64() / REPS as f64)
         };
 
-        eprintln!("1 token, GB/s of weights; variants {VARIANTS:?} (u = unsigned digits)");
+        eprintln!("1 token, GB/s of weights; variants {VARIANTS:?}");
         let shapes = [
             (17408, 5120, "ffn gate/up"),
             (5120, 17408, "ffn down"),
@@ -626,14 +625,9 @@ mod tests {
                     .map(|(g, b)| (g - b).powi(2))
                     .sum::<f32>()
                     .sqrt();
-                // Unsigned decode reorders float partial sums, so it only matches to rounding.
-                let tol = if variant < UNSIGNED_FROM {
-                    0.0
-                } else {
-                    UNSIGNED_REL_ERR
-                };
+                // Different lane layouts reorder float partial sums, so kernels match to rounding.
                 assert!(
-                    err <= tol * norm,
+                    err <= VARIANT_REL_ERR * norm,
                     "{label} variant {variant}: {}",
                     err / norm
                 );
