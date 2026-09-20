@@ -493,6 +493,7 @@ mod tests {
             (2048, 3, true),
             (2048, 4, false),
             (2048, 5, false),
+            (2048, 40, true),
             (3072, 300, true),
         ];
         for (in_dim, tokens, folded) in cases {
@@ -660,6 +661,25 @@ mod tests {
                 eprintln!(
                     "{out_dim:>6} x {in_dim:<5} tokens {tokens:>2}: {}",
                     cells.join(" | ")
+                );
+            }
+        }
+
+        eprintln!("prefill sweep, ms per matmul; lanes | tensor-core gemm");
+        for (out_dim, in_dim) in [(17408, 5120), (5120, 17408)] {
+            let (bytes, _) = synthetic(out_dim, in_dim, 1);
+            let transform = RowTransform::for_test(HadamardRole::Fold, in_dim, 11, false);
+            let gpu = PackedWeights::upload(&bytes, Some(&transform), &dev)?;
+            for tokens in [16, 32, 64, 128, 256] {
+                let x = vec![0.5f32; tokens * in_dim];
+                let input = Tensor::from_vec(x, (tokens, in_dim), &dev)?.to_dtype(DType::BF16)?;
+                let lanes = time(&|| gpu.matmul_variant(&input, out_dim, 0))?;
+                let gemm = time(&|| gpu.matmul_variant(&input, out_dim, 5))?;
+                eprintln!(
+                    "{out_dim:>6} x {in_dim:<5} tokens {tokens:>3}: {:7.3} | {:7.3}  ({:.1}x)",
+                    lanes * 1e3,
+                    gemm * 1e3,
+                    lanes / gemm
                 );
             }
         }

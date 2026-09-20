@@ -110,6 +110,18 @@ PTQ1_0_HD int decode_step(uint32_t &v_lo, uint32_t &v_hi, uint32_t mult) {
       sub_bytes(static_cast<uint32_t>(decode_digits(v_lo, v_hi, mult)), ONES));
 }
 
+// The 8 qh weights as two dp4a groups (elements 120..123 and 124..127) of
+// signed trits; the second group starts two digits further on.
+PTQ1_0_HD void decode_qh(uint32_t word, int &first, int &second) {
+  uint32_t lo, hi;
+  init_state(word, BLOCK_WORDS - 1, lo, hi);
+  const uint32_t w1_lo = ((lo * 9u) & LANE_MASK) * 3u;
+  const uint32_t w1_hi = ((lo * 27u) & LANE_MASK) * 3u;
+  first = static_cast<int>(
+      sub_bytes(byte_perm(lo * 3u, hi * 3u, 0x7531), ONES));
+  second = static_cast<int>(sub_bytes(byte_perm(w1_lo, w1_hi, 0x7531), ONES));
+}
+
 // Weight `e` (0..127) of a block as -1, 0 or 1, following the packed element
 // order of the qs and qh bytes.
 PTQ1_0_HD int element_trit(const uint8_t *blk, int e) {

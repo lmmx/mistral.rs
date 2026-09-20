@@ -1892,4 +1892,50 @@ extern "C" {
         variant: i32,
         stream: *mut c_void,
     );
+
+    /// PTQ1_0 tensor-core GEMM for prefill: bf16 activations, weights decoded to bf16 tiles (sm_80+)
+    #[cfg(has_ptq1_0_wmma_kernels)]
+    pub fn launch_ptq1_0_gemm_f32(
+        x: *const c_void,
+        w: *const c_void,
+        signs: *const c_void,
+        gather: *const c_void,
+        scratch: *mut c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        b_size: i32,
+        do_fwht: i32,
+        stream: *mut c_void,
+    );
+
+    #[cfg(has_ptq1_0_wmma_kernels)]
+    pub fn launch_ptq1_0_gemm_f16(
+        x: *const c_void,
+        w: *const c_void,
+        signs: *const c_void,
+        gather: *const c_void,
+        scratch: *mut c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        b_size: i32,
+        do_fwht: i32,
+        stream: *mut c_void,
+    );
+
+    #[cfg(has_ptq1_0_wmma_kernels)]
+    pub fn launch_ptq1_0_gemm_bf16(
+        x: *const c_void,
+        w: *const c_void,
+        signs: *const c_void,
+        gather: *const c_void,
+        scratch: *mut c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        b_size: i32,
+        do_fwht: i32,
+        stream: *mut c_void,
+    );
 }
