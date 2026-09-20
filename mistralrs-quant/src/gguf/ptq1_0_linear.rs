@@ -579,6 +579,8 @@ mod tests {
         use crate::gguf::ptq1_0_cuda::PackedWeights;
 
         const REPS: usize = 50;
+        const UNSIGNED_FROM: i32 = 3;
+        const UNSIGNED_REL_ERR: f32 = 5e-3;
         const VARIANTS: [&str; 6] = ["pf2", "pf4", "pf8", "pf2 u", "pf4 u", "pf8 u"];
         let dev = Device::new_cuda(0)?;
         let time = |f: &dyn Fn() -> Result<Tensor>| -> Result<f64> {
@@ -608,16 +610,31 @@ mod tests {
             let transform = RowTransform::for_test(HadamardRole::Fold, in_dim, 11, false);
             let gpu = PackedWeights::upload(&bytes, Some(&transform), &dev)?;
             let input = Tensor::from_vec(x, (1, in_dim), &dev)?.to_dtype(DType::BF16)?;
-            let baseline = gpu
-                .matmul_variant(&input, out_dim, 0)?
-                .to_dtype(DType::F32)?;
+            let floats = |t: Tensor| -> Result<Vec<f32>> {
+                t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()
+            };
+            let baseline = floats(gpu.matmul_variant(&input, out_dim, 0)?)?;
+            let norm = baseline.iter().map(|v| v * v).sum::<f32>().sqrt();
             let mut row = Vec::new();
             for variant in 0..VARIANTS.len() as i32 {
-                let got = gpu
-                    .matmul_variant(&input, out_dim, variant)?
-                    .to_dtype(DType::F32)?;
-                let diff = (&got - &baseline)?.abs()?.max_all()?.to_scalar::<f32>()?;
-                assert_eq!(diff, 0.0, "{label} variant {variant} differs from pf2");
+                let got = floats(gpu.matmul_variant(&input, out_dim, variant)?)?;
+                let err = got
+                    .iter()
+                    .zip(&baseline)
+                    .map(|(g, b)| (g - b).powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                // Unsigned decode reorders float partial sums, so it only matches to rounding.
+                let tol = if variant < UNSIGNED_FROM {
+                    0.0
+                } else {
+                    UNSIGNED_REL_ERR
+                };
+                assert!(
+                    err <= tol * norm,
+                    "{label} variant {variant}: {}",
+                    err / norm
+                );
                 let secs = time(&|| gpu.matmul_variant(&input, out_dim, variant))?;
                 row.push(format!("{:5.0}", bytes.len() as f64 / secs / 1e9));
             }
