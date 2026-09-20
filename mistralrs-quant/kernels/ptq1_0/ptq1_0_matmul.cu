@@ -16,7 +16,7 @@
 #define BLOCKS_PER_WARP_STEP 4 // 4 blocks x 7 words fill 28 of 32 lanes
 #define BPL_LANES_PER_ROW 8 // K / 128 is a multiple of 8 for folded weights
 #define BPL_ROWS_PER_WARP (WARP_SIZE / BPL_LANES_PER_ROW)
-#define BPL_MAX_TOKENS 1
+#define BPL_MAX_TOKENS 4 // beyond this the lane kernel is faster
 #define SCALE_WORD (ptq1_0::BLOCK_WORDS - 1) // scale is in its top half
 #define FWHT_SCALE 0.03125f    // 1 / sqrt(FWHT_BLOCK)
 #define INT8_MAX_F 127.0f
@@ -406,8 +406,8 @@ static void ptq1_0_launch_bpl(const void *x, const void *w, const void *signs,
       ncols_x, nrows_x, b_size);
 }
 
-// The thread-per-block kernel wins for single-token decode; with several
-// tokens per pass its per-thread state costs more than it saves.
+// The thread-per-block kernel, one token per pass, wins up to a few tokens;
+// beyond that the lane kernel amortizes the weight decode better.
 template <typename T>
 static void ptq1_0_launch(const void *x, const void *w, const void *signs,
                           const void *gather, void *scratch, void *dst,

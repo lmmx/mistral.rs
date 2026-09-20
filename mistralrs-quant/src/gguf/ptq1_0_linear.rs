@@ -490,6 +490,8 @@ mod tests {
         let cases = [
             (384, 1, false),
             (2048, 1, true),
+            (2048, 3, true),
+            (2048, 4, false),
             (2048, 5, false),
             (3072, 300, true),
         ];
