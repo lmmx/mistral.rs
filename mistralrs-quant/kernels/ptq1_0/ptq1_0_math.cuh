@@ -94,13 +94,20 @@ PTQ1_0_HD void init_state(uint32_t word, int word_index, uint32_t &v_lo,
                                       : (v_lo * 3u) & LANE_MASK;
 }
 
-// Four signed trits (one per byte) for the next step, advancing the state.
-PTQ1_0_HD int decode_step(uint32_t &v_lo, uint32_t &v_hi, uint32_t mult) {
+// Four trit digits 0..2 (one per byte, weight + 1) for the next step,
+// advancing the state.
+PTQ1_0_HD int decode_digits(uint32_t &v_lo, uint32_t &v_hi, uint32_t mult) {
   const uint32_t w_lo = v_lo * 3u;
   const uint32_t w_hi = v_hi * 3u;
   v_lo = (v_lo * mult) & LANE_MASK;
   v_hi = (v_hi * mult) & LANE_MASK;
-  return static_cast<int>(sub_bytes(byte_perm(w_lo, w_hi, 0x7531), ONES));
+  return static_cast<int>(byte_perm(w_lo, w_hi, 0x7531));
+}
+
+// The same four trits as signed weights -1..1.
+PTQ1_0_HD int decode_step(uint32_t &v_lo, uint32_t &v_hi, uint32_t mult) {
+  return static_cast<int>(
+      sub_bytes(static_cast<uint32_t>(decode_digits(v_lo, v_hi, mult)), ONES));
 }
 
 // Weight `e` (0..127) of a block as -1, 0 or 1, following the packed element

@@ -578,8 +578,56 @@ mod tests {
     fn cuda_matmul_speed() -> Result<()> {
         use crate::gguf::ptq1_0_cuda::PackedWeights;
 
-        const REPS: usize = 20;
+        const REPS: usize = 50;
+        const VARIANTS: [&str; 6] = ["pf2", "pf4", "pf8", "pf2 u", "pf4 u", "pf8 u"];
         let dev = Device::new_cuda(0)?;
+        let time = |f: &dyn Fn() -> Result<Tensor>| -> Result<f64> {
+            f()?;
+            dev.synchronize()?;
+            let start = Instant::now();
+            for _ in 0..REPS {
+                f()?;
+            }
+            dev.synchronize()?;
+            Ok(start.elapsed().as_secs_f64() / REPS as f64)
+        };
+
+        eprintln!("1 token, GB/s of weights; variants {VARIANTS:?} (u = unsigned digits)");
+        let shapes = [
+            (17408, 5120, "ffn gate/up"),
+            (5120, 17408, "ffn down"),
+            (10240, 5120, "gdn qkv"),
+            (6144, 5120, "gdn gate"),
+            (5120, 6144, "ssm out"),
+            (12288, 5120, "attn q"),
+            (1024, 5120, "attn k/v"),
+            (248320, 5120, "output"),
+        ];
+        for (out_dim, in_dim, label) in shapes {
+            let (bytes, x) = synthetic(out_dim, in_dim, 1);
+            let transform = RowTransform::for_test(HadamardRole::Fold, in_dim, 11, false);
+            let gpu = PackedWeights::upload(&bytes, Some(&transform), &dev)?;
+            let input = Tensor::from_vec(x, (1, in_dim), &dev)?.to_dtype(DType::BF16)?;
+            let baseline = gpu
+                .matmul_variant(&input, out_dim, 0)?
+                .to_dtype(DType::F32)?;
+            let mut row = Vec::new();
+            for variant in 0..VARIANTS.len() as i32 {
+                let got = gpu
+                    .matmul_variant(&input, out_dim, variant)?
+                    .to_dtype(DType::F32)?;
+                let diff = (&got - &baseline)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                assert_eq!(diff, 0.0, "{label} variant {variant} differs from pf2");
+                let secs = time(&|| gpu.matmul_variant(&input, out_dim, variant))?;
+                row.push(format!("{:5.0}", bytes.len() as f64 / secs / 1e9));
+            }
+            eprintln!(
+                "{out_dim:>6} x {in_dim:<5} {label:<12} {:>6.1} MB  {}",
+                bytes.len() as f64 / 1e6,
+                row.join(" ")
+            );
+        }
+
         let (out_dim, in_dim) = (5120, 17408);
         let (bytes, _) = synthetic(out_dim, in_dim, 1);
         let transform = RowTransform::for_test(HadamardRole::Fold, in_dim, 11, false);
@@ -587,18 +635,11 @@ mod tests {
         for tokens in [1, 8, 59, 256] {
             let x = vec![0.5f32; tokens * in_dim];
             let input = Tensor::from_vec(x, (tokens, in_dim), &dev)?.to_dtype(DType::BF16)?;
-            gpu.matmul(&input, out_dim, in_dim)?;
-            dev.synchronize()?;
-            let start = Instant::now();
-            for _ in 0..REPS {
-                gpu.matmul(&input, out_dim, in_dim)?;
-            }
-            dev.synchronize()?;
-            let secs = start.elapsed().as_secs_f64() / REPS as f64;
-            let gbps = bytes.len() as f64 / secs / 1e9;
+            let secs = time(&|| gpu.matmul(&input, out_dim, in_dim))?;
             eprintln!(
-                "cuda tokens {tokens}: {:.3} ms, {gbps:.1} GB/s of weights",
-                secs * 1e3
+                "production kernel, tokens {tokens}: {:.3} ms, {:.1} GB/s of weights",
+                secs * 1e3,
+                bytes.len() as f64 / secs / 1e9
             );
         }
         Ok(())

@@ -1876,4 +1876,20 @@ extern "C" {
         n_ids: i32,
         stream: *mut c_void,
     );
+
+    /// Benchmark-only PTQ1_0 matmul variants (prefetch depth, unsigned digit decode)
+    pub fn launch_ptq1_0_matmul_variant_bf16(
+        x: *const c_void,
+        w: *const c_void,
+        signs: *const c_void,
+        gather: *const c_void,
+        scratch: *mut c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        nrows_x: i32,
+        b_size: i32,
+        do_fwht: i32,
+        variant: i32,
+        stream: *mut c_void,
+    );
 }

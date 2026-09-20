@@ -258,4 +258,58 @@ impl PackedWeights {
             Shape::from((n_ids, ncols)),
         )))
     }
+
+    /// Benchmark-only: bf16 input through one of the kernel variants (prefetch depth, digit decode).
+    #[cfg(test)]
+    pub(crate) fn matmul_variant(&self, xs: &Tensor, nrows: usize, variant: i32) -> Result<Tensor> {
+        let Device::Cuda(dev) = xs.device() else {
+            candle_core::bail!("PTQ1_0 CUDA path: input must live on CUDA");
+        };
+        let (b_size, k) = xs.dims2()?;
+        let stream = dev.cuda_stream();
+        let stream_ptr = stream.cu_stream() as *mut c_void;
+        let (xs_storage, xs_layout) = xs.storage_and_layout();
+        let (w_storage, w_layout) = self.blocks.storage_and_layout();
+        let signs_pair = self.signs.as_ref().map(|t| t.storage_and_layout());
+        let (x_ptr, _x_guard) =
+            cuda_ptr::<half::bf16>(&xs_storage, xs_layout.start_offset(), &stream)?;
+        let (w_ptr, _w_guard) = cuda_ptr::<u8>(&w_storage, w_layout.start_offset(), &stream)?;
+        let signs = signs_pair
+            .as_ref()
+            .map(|(s, l)| cuda_ptr::<f32>(s, l.start_offset(), &stream))
+            .transpose()?;
+        let signs_ptr = signs
+            .as_ref()
+            .map_or(std::ptr::null(), |(p, _)| *p as *const c_void);
+
+        let groups = k / PTQ1_0_BLOCK_ELEMS;
+        let scratch_bytes = b_size * (k + 2 * groups * size_of::<f32>());
+        let mut workspace = workspace_ensure(dev, scratch_bytes, &stream)?;
+        let (scratch_ptr, _scratch_guard) = workspace.ptr_mut();
+        let mut out = unsafe { dev.alloc::<half::bf16>(b_size * nrows)? };
+        {
+            let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
+            unsafe {
+                ffi::launch_ptq1_0_matmul_variant_bf16(
+                    x_ptr as *const c_void,
+                    w_ptr as *const c_void,
+                    signs_ptr,
+                    std::ptr::null(),
+                    scratch_ptr as *mut c_void,
+                    out_ptr as *mut c_void,
+                    k as i32,
+                    nrows as i32,
+                    b_size as i32,
+                    i32::from(self.signs.is_some()),
+                    variant,
+                    stream_ptr,
+                );
+            }
+        }
+        let out_storage = CudaStorage::wrap_cuda_slice(out, dev.clone());
+        Ok(Tensor::from((
+            Storage::Cuda(out_storage),
+            Shape::from((b_size, nrows)),
+        )))
+    }
 }
