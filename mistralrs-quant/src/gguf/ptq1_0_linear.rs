@@ -352,6 +352,31 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "timing"]
+    fn packed_matmul_gap_overhead() {
+        let (out_dim, in_dim) = (5120, 17408);
+        let (bytes, x) = synthetic(out_dim, in_dim, 1);
+        packed_matmul(&bytes, out_dim, in_dim, &x, 1);
+        for gap_us in [0u64, 20, 100, 300] {
+            let reps = 200;
+            let mut busy = std::time::Duration::ZERO;
+            for _ in 0..reps {
+                let start = Instant::now();
+                std::hint::black_box(packed_matmul(&bytes, out_dim, in_dim, &x, 1));
+                busy += start.elapsed();
+                let gap = Instant::now();
+                while gap.elapsed() < std::time::Duration::from_micros(gap_us) {
+                    std::hint::spin_loop();
+                }
+            }
+            eprintln!(
+                "gap {gap_us} us: {:.0} us per matmul",
+                busy.as_secs_f64() * 1e6 / reps as f64
+            );
+        }
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs a CUDA device"]

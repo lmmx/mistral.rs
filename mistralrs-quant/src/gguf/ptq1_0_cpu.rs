@@ -3,6 +3,7 @@
 use rayon::prelude::*;
 
 use super::ptq1_0::{block_scale, unpack_block_trits, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS};
+use super::ptq1_0_pool::{Chunks, Pool};
 
 const INT8_MAX_F: f32 = 127.0;
 const LANES: usize = 8;
@@ -11,6 +12,8 @@ const VECS_PER_BLOCK: usize = PTQ1_0_BLOCK_ELEMS / VEC_BYTES;
 pub(super) const ROWS_PER_TASK: usize = 16;
 pub(super) const TOKEN_TILE: usize = 32;
 pub(super) const K_TILE_BLOCKS: usize = 8;
+/// Up to this many tokens the matmul runs on the spin-then-park pool; above it rayon amortizes its wake-up.
+pub(super) const POOL_MAX_TOKENS: usize = 4;
 const ROW_BLOCK: usize = 4;
 pub(super) const TOKEN_BLOCK: usize = 2;
 
@@ -26,6 +29,18 @@ struct Acts {
     blocks_per_row: usize,
 }
 
+fn quantize_block(x: &[f32], q: &mut Elems<i8>, scale: &mut f32, sum: &mut i32) {
+    let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let inv = if amax > 0.0 { INT8_MAX_F / amax } else { 0.0 };
+    *scale = amax / INT8_MAX_F;
+    let mut total = 0i32;
+    for (q, v) in q.iter_mut().zip(x) {
+        *q = (v * inv).round_ties_even() as i8;
+        total += *q as i32;
+    }
+    *sum = total;
+}
+
 fn quantize(xt: &[f32], in_dim: usize) -> Acts {
     let n_blocks = xt.len() / PTQ1_0_BLOCK_ELEMS;
     let mut acts = Acts {
@@ -34,20 +49,20 @@ fn quantize(xt: &[f32], in_dim: usize) -> Acts {
         sums: vec![0; n_blocks],
         blocks_per_row: in_dim / PTQ1_0_BLOCK_ELEMS,
     };
-    xt.par_chunks(PTQ1_0_BLOCK_ELEMS)
-        .zip(acts.q.par_iter_mut())
-        .zip(acts.scales.par_iter_mut().zip(acts.sums.par_iter_mut()))
-        .for_each(|((x, q), (scale, sum))| {
-            let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
-            let inv = if amax > 0.0 { INT8_MAX_F / amax } else { 0.0 };
-            *scale = amax / INT8_MAX_F;
-            let mut total = 0i32;
-            for (q, v) in q.iter_mut().zip(x) {
-                *q = (v * inv).round_ties_even() as i8;
-                total += *q as i32;
-            }
-            *sum = total;
-        });
+    if xt.len() <= POOL_MAX_TOKENS * in_dim {
+        for ((x, q), (scale, sum)) in xt
+            .chunks(PTQ1_0_BLOCK_ELEMS)
+            .zip(acts.q.iter_mut())
+            .zip(acts.scales.iter_mut().zip(acts.sums.iter_mut()))
+        {
+            quantize_block(x, q, scale, sum);
+        }
+    } else {
+        xt.par_chunks(PTQ1_0_BLOCK_ELEMS)
+            .zip(acts.q.par_iter_mut())
+            .zip(acts.scales.par_iter_mut().zip(acts.sums.par_iter_mut()))
+            .for_each(|((x, q), (scale, sum))| quantize_block(x, q, scale, sum));
+    }
     acts
 }
 
@@ -440,19 +455,34 @@ pub(super) fn packed_matmul_with(
     let row_bytes = in_dim / PTQ1_0_BLOCK_ELEMS * PTQ1_0_BLOCK_BYTES;
     let acts = quantize(xt, in_dim);
     let mut by_row = vec![0f32; out_dim * tokens];
-    by_row
-        .par_chunks_mut(ROWS_PER_TASK * tokens)
-        .zip(bytes.par_chunks(ROWS_PER_TASK * row_bytes))
-        .for_each_init(Scratch::new, |sc, (out, rows)| {
-            // SAFETY: `Avx2` is only picked by `Backend::detect` after the runtime check
-            unsafe {
-                match backend {
-                    Backend::Scalar => matmul_rows::<Scalar>(sc, out, rows, &acts, tokens),
-                    #[cfg(target_arch = "x86_64")]
-                    Backend::Avx2 => matmul_rows_avx2(sc, out, rows, &acts, tokens),
-                }
+    let run_rows = |sc: &mut Scratch, out: &mut [f32], rows: &[u8]| {
+        // SAFETY: `Avx2` is only picked by `Backend::detect` after the runtime check
+        unsafe {
+            match backend {
+                Backend::Scalar => matmul_rows::<Scalar>(sc, out, rows, &acts, tokens),
+                #[cfg(target_arch = "x86_64")]
+                Backend::Avx2 => matmul_rows_avx2(sc, out, rows, &acts, tokens),
             }
+        }
+    };
+    if tokens <= POOL_MAX_TOKENS {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::new());
+        }
+        let chunks = Chunks::new(&mut by_row, ROWS_PER_TASK * tokens);
+        Pool::global().run(out_dim.div_ceil(ROWS_PER_TASK), &|i| {
+            let start = i * ROWS_PER_TASK * row_bytes;
+            let rows = &bytes[start..(start + ROWS_PER_TASK * row_bytes).min(bytes.len())];
+            // SAFETY: task `i` is the only one touching output chunk `i`
+            let out = unsafe { chunks.get(i) };
+            SCRATCH.with(|sc| run_rows(&mut sc.borrow_mut(), out, rows));
         });
+    } else {
+        by_row
+            .par_chunks_mut(ROWS_PER_TASK * tokens)
+            .zip(bytes.par_chunks(ROWS_PER_TASK * row_bytes))
+            .for_each_init(Scratch::new, |sc, (out, rows)| run_rows(sc, out, rows));
+    }
     let mut out = vec![0f32; tokens * out_dim];
     for (r, col) in by_row.chunks_exact(tokens).enumerate() {
         for (t, v) in col.iter().enumerate() {
