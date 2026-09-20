@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use candle_core::{quantized::GgmlDType, DType, Device, Error, Result, Shape, Tensor};
 use candle_nn::{var_builder::SimpleBackend, Linear};
@@ -337,6 +340,7 @@ impl GgufWeightSource {
         let hadamard = HadamardSpec::from_metadata(archive.metadata())?;
         if let Some(spec) = &hadamard {
             validate_hadamard_widths(&archive, spec)?;
+            validate_fold_coverage(&archive, spec, &bindings)?;
         }
         Ok(Self {
             archive,
@@ -1188,6 +1192,62 @@ fn decode_prism_ternary(raw_dtype: u32, bytes: &[u8], shape: &[usize]) -> Result
     Ok(out)
 }
 
+const UNCONSUMED_FOLDS_SHOWN: usize = 3;
+
+fn collect_bound_tensors<'a>(binding: &'a GgufTensorBinding, names: &mut HashSet<&'a str>) {
+    use GgufTensorBinding as B;
+    match binding {
+        B::Tensor(name) | B::Mxfp4Blocks(name) | B::Mxfp4Scales(name) => {
+            names.insert(name);
+        }
+        B::Concat { inputs, .. } | B::Stack { inputs, .. } | B::Interleave { inputs, .. } => inputs
+            .iter()
+            .for_each(|input| collect_bound_tensors(input, names)),
+        B::Slice { input, .. }
+        | B::Transpose { input, .. }
+        | B::Permute { input, .. }
+        | B::Reshape { input, .. }
+        | B::Affine { input, .. }
+        | B::Log { input }
+        | B::InverseSoftplus { input }
+        | B::Cast { input, .. } => collect_bound_tensors(input, names),
+    }
+}
+
+/// A folded tensor missing from the file is an error; one that no binding consumes only warns.
+fn validate_fold_coverage(
+    archive: &GgufArchive,
+    spec: &HadamardSpec,
+    bindings: &HashMap<String, GgufTensorBinding>,
+) -> Result<()> {
+    let mut bound = HashSet::new();
+    bindings
+        .values()
+        .for_each(|binding| collect_bound_tensors(binding, &mut bound));
+    let mut unconsumed = Vec::new();
+    for name in spec.folded_names() {
+        if archive.tensor_info(name).is_err() {
+            candle_core::bail!(
+                "Hadamard tensor `{name}` is listed in the metadata but missing from the file"
+            );
+        }
+        if !bound.contains(name) {
+            unconsumed.push(name);
+        }
+    }
+    if !unconsumed.is_empty() {
+        let shown = unconsumed
+            .iter()
+            .take(UNCONSUMED_FOLDS_SHOWN)
+            .collect::<Vec<_>>();
+        tracing::warn!(
+            "{} Hadamard-folded tensors are not consumed by the model (e.g. {shown:?})",
+            unconsumed.len()
+        );
+    }
+    Ok(())
+}
+
 fn validate_hadamard_widths(archive: &GgufArchive, spec: &HadamardSpec) -> Result<()> {
     for name in spec.folded_names() {
         let Ok(info) = archive.tensor_info(name) else {
@@ -1550,6 +1610,13 @@ mod tests {
     }
 
     fn fold_archive(with_fold: bool) -> Result<(NamedTempFile, Arc<GgufArchive>)> {
+        fold_archive_named(with_fold, FOLD_TENSOR)
+    }
+
+    fn fold_archive_named(
+        with_fold: bool,
+        listed_weight: &str,
+    ) -> Result<(NamedTempFile, Arc<GgufArchive>)> {
         let mut kvs = Vec::new();
         let mut kv_count = 0u64;
         if with_fold {
@@ -1566,7 +1633,7 @@ mod tests {
                 &mut kvs,
                 "prism.hadamard.weight_names",
                 8,
-                &[string_elem(FOLD_TENSOR)],
+                &[string_elem(listed_weight)],
             );
             kv_array(
                 &mut kvs,
@@ -1638,6 +1705,52 @@ mod tests {
     fn decoded(seed: usize) -> Vec<f32> {
         let bytes = test_trit_rows(seed);
         decode_prism_ternary(PTQ1_0_GGUF_TYPE, &bytes, &[FOLD_OUT, FOLD_IN]).unwrap()
+    }
+
+    #[test]
+    fn skipping_the_fold_changes_the_output() -> Result<()> {
+        let x: Vec<f32> = (0..FOLD_IN)
+            .map(|i| ((i * 13) % 17) as f32 / 8.0 - 1.0)
+            .collect();
+        let input = Tensor::from_vec(x, (1, FOLD_IN), &Device::Cpu)?;
+        let mut outputs = Vec::new();
+        for with_fold in [true, false] {
+            let (_file, source) = fold_source(with_fold, true)?;
+            let layer = source
+                .load_linear("model.down", &Device::Cpu, Shard::default())?
+                .unwrap();
+            outputs.push(layer.forward(&input)?.flatten_all()?.to_vec1::<f32>()?);
+        }
+        let diff: f32 = outputs[0]
+            .iter()
+            .zip(&outputs[1])
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        let norm: f32 = outputs[1].iter().map(|v| v.abs()).sum();
+        assert!(
+            diff > 0.1 * norm,
+            "fold barely changed the output: {diff} vs {norm}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fold_listed_but_missing_from_file_is_refused() -> Result<()> {
+        let (_file, archive) = fold_archive_named(true, "blk.9.gone.weight")?;
+        let bindings = GgufBindingMap::new()
+            .with_binding("model.down.weight", GgufTensorBinding::tensor(FOLD_TENSOR));
+        let err = GgufWeightSource::new(archive, &bindings, DType::F32).unwrap_err();
+        assert!(err.to_string().contains("missing from the file"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn fold_not_consumed_by_any_binding_still_loads() -> Result<()> {
+        let (_file, archive) = fold_archive(true)?;
+        let bindings = GgufBindingMap::new()
+            .with_binding("model.up.weight", GgufTensorBinding::tensor(PLAIN_TENSOR));
+        GgufWeightSource::new(archive, &bindings, DType::F32)?;
+        Ok(())
     }
 
     #[test]
