@@ -37,6 +37,28 @@ static __device__ __forceinline__ void store_float(__nv_bfloat16 *p, float v) {
   *p = __float2bfloat16(v);
 }
 
+static __device__ __forceinline__ float block_scale(const uint8_t *blk) {
+  const unsigned short bits = *reinterpret_cast<const unsigned short *>(
+      blk + ptq1_0::BLOCK_BYTES - 2);
+  return __half2float(__ushort_as_half(bits));
+}
+
+// Unnormalized FWHT of the FWHT_BLOCK floats in `s`; every thread of the CTA
+// must call it.
+static __device__ __forceinline__ void fwht_shared(float *s, int tid) {
+  for (int h = 1; h < ptq1_0::FWHT_BLOCK; h <<= 1) {
+    for (int pair = tid; pair < ptq1_0::FWHT_BLOCK / 2;
+         pair += PREPARE_THREADS) {
+      const int i0 = ptq1_0::fwht_low_index(pair, h);
+      const float a = s[i0];
+      const float b = s[i0 + h];
+      s[i0] = a + b;
+      s[i0 + h] = a - b;
+    }
+    __syncthreads();
+  }
+}
+
 // One CTA per (FWHT_BLOCK columns, token): gather, signs and FWHT in shared
 // memory, then int8 quantization with one scale per 128 columns. Without
 // do_fwht it only quantizes.
@@ -65,17 +87,7 @@ ptq1_0_prepare_kernel(const T *__restrict__ x, const float *__restrict__ signs,
   __syncthreads();
 
   if (do_fwht) {
-    for (int h = 1; h < ptq1_0::FWHT_BLOCK; h <<= 1) {
-      for (int pair = tid; pair < ptq1_0::FWHT_BLOCK / 2;
-           pair += PREPARE_THREADS) {
-        const int i0 = ptq1_0::fwht_low_index(pair, h);
-        const float a = s[i0];
-        const float b = s[i0 + h];
-        s[i0] = a + b;
-        s[i0 + h] = a - b;
-      }
-      __syncthreads();
-    }
+    fwht_shared(s, tid);
   }
 
   // Each warp quantizes one 128-column segment, four columns per lane.
@@ -232,6 +244,39 @@ static void ptq1_0_launch(const void *x, const void *w, const void *signs,
   }
 }
 
+// One CTA per token id: decodes the packed row, then the inverse fold (FWHT,
+// then signs) that latent embedding rows need.
+template <typename OutT>
+static __global__ void
+ptq1_0_embedding_kernel(const uint32_t *__restrict__ ids,
+                        const uint8_t *__restrict__ w,
+                        const float *__restrict__ signs,
+                        OutT *__restrict__ dst, int ncols_x) {
+  __shared__ float s[ptq1_0::FWHT_BLOCK];
+  const int tid = threadIdx.x;
+  const int nblk = ncols_x / ptq1_0::BLOCK_ELEMS;
+  const uint8_t *row =
+      w + static_cast<size_t>(ids[blockIdx.x]) * nblk * ptq1_0::BLOCK_BYTES;
+  OutT *out = dst + static_cast<size_t>(blockIdx.x) * ncols_x;
+
+  for (int col0 = 0; col0 < ncols_x; col0 += ptq1_0::FWHT_BLOCK) {
+    for (int i = tid; i < ptq1_0::FWHT_BLOCK; i += PREPARE_THREADS) {
+      const int p = col0 + i;
+      const size_t block_at = p / ptq1_0::BLOCK_ELEMS;
+      const uint8_t *blk = row + block_at * ptq1_0::BLOCK_BYTES;
+      s[i] = static_cast<float>(
+                 ptq1_0::element_trit(blk, p % ptq1_0::BLOCK_ELEMS)) *
+             block_scale(blk);
+    }
+    __syncthreads();
+    fwht_shared(s, tid);
+    for (int i = tid; i < ptq1_0::FWHT_BLOCK; i += PREPARE_THREADS) {
+      store_float(out + col0 + i, s[i] * FWHT_SCALE * signs[col0 + i]);
+    }
+    __syncthreads();
+  }
+}
+
 // Host-side launchers used by `mistralrs-quant/src/gguf/ffi.rs`.
 
 #define PTQ1_0_LAUNCHER(tag, c_type)                                           \
@@ -246,3 +291,19 @@ static void ptq1_0_launch(const void *x, const void *w, const void *signs,
 PTQ1_0_LAUNCHER(f32, float)
 PTQ1_0_LAUNCHER(f16, __half)
 PTQ1_0_LAUNCHER(bf16, __nv_bfloat16)
+
+#define PTQ1_0_EMBEDDING_LAUNCHER(tag, c_type)                                 \
+  extern "C" void launch_ptq1_0_embedding_##tag(                               \
+      const void *ids, const void *w, const void *signs, void *dst,            \
+      int ncols_x, int n_ids, void *stream) {                                  \
+    ptq1_0_embedding_kernel<c_type>                                            \
+        <<<n_ids, PREPARE_THREADS, 0, static_cast<cudaStream_t>(stream)>>>(    \
+            static_cast<const uint32_t *>(ids),                                \
+            static_cast<const uint8_t *>(w),                                   \
+            static_cast<const float *>(signs), static_cast<c_type *>(dst),     \
+            ncols_x);                                                          \
+  }
+
+PTQ1_0_EMBEDDING_LAUNCHER(f32, float)
+PTQ1_0_EMBEDDING_LAUNCHER(f16, __half)
+PTQ1_0_EMBEDDING_LAUNCHER(bf16, __nv_bfloat16)

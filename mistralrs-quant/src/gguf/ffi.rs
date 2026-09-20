@@ -1845,4 +1845,35 @@ extern "C" {
         do_fwht: i32,
         stream: *mut c_void,
     );
+
+    /// PTQ1_0 embedding rows: decode, FWHT, then signs (the inverse fold)
+    pub fn launch_ptq1_0_embedding_f32(
+        ids: *const c_void,
+        w: *const c_void,
+        signs: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        n_ids: i32,
+        stream: *mut c_void,
+    );
+
+    pub fn launch_ptq1_0_embedding_f16(
+        ids: *const c_void,
+        w: *const c_void,
+        signs: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        n_ids: i32,
+        stream: *mut c_void,
+    );
+
+    pub fn launch_ptq1_0_embedding_bf16(
+        ids: *const c_void,
+        w: *const c_void,
+        signs: *const c_void,
+        dst: *mut c_void,
+        ncols_x: i32,
+        n_ids: i32,
+        stream: *mut c_void,
+    );
 }

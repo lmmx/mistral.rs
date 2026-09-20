@@ -34,7 +34,18 @@ pub(crate) struct PackedWeights {
     blocks: Tensor,
     signs: Option<Tensor>,
     gather: Option<Tensor>,
+    inverse: bool,
 }
+
+type EmbeddingLauncher = unsafe extern "C" fn(
+    ids: *const c_void,
+    w: *const c_void,
+    signs: *const c_void,
+    dst: *mut c_void,
+    ncols_x: i32,
+    n_ids: i32,
+    stream: *mut c_void,
+);
 
 fn cuda_ptr<'a, T: CudaDType + DeviceRepr + 'a>(
     storage: &'a Storage,
@@ -71,6 +82,7 @@ impl PackedWeights {
             blocks,
             signs,
             gather,
+            inverse: transform.is_some_and(RowTransform::is_inverse),
         })
     }
 
@@ -79,6 +91,11 @@ impl PackedWeights {
         let Device::Cuda(dev) = xs.device() else {
             candle_core::bail!("PTQ1_0 CUDA path: input must live on CUDA");
         };
+        if self.inverse {
+            candle_core::bail!(
+                "PTQ1_0 CUDA path: inverse-role tensors only support embedding lookups"
+            );
+        }
         let Some((&k, batch_dims)) = xs.dims().split_last() else {
             candle_core::bail!("PTQ1_0 CUDA path: input must have at least one dimension");
         };
@@ -174,6 +191,71 @@ impl PackedWeights {
         Ok(Tensor::from((
             Storage::Cuda(out_storage),
             Shape::from((b_size, nrows)),
+        )))
+    }
+
+    /// Rows of the packed table for `ids`, with the inverse fold applied; returns `[ids..., ncols]`.
+    pub(crate) fn embedding(&self, ids: &Tensor, ncols: usize, dtype: DType) -> Result<Tensor> {
+        let Device::Cuda(dev) = ids.device() else {
+            candle_core::bail!("PTQ1_0 CUDA path: ids must live on CUDA");
+        };
+        let ids2 = ids.to_dtype(DType::U32)?.contiguous()?;
+        let out = match dtype {
+            DType::F32 => self.embed::<f32>(dev, &ids2, ncols, ffi::launch_ptq1_0_embedding_f32),
+            DType::F16 => {
+                self.embed::<half::f16>(dev, &ids2, ncols, ffi::launch_ptq1_0_embedding_f16)
+            }
+            DType::BF16 => {
+                self.embed::<half::bf16>(dev, &ids2, ncols, ffi::launch_ptq1_0_embedding_bf16)
+            }
+            other => candle_core::bail!("PTQ1_0 CUDA path: unsupported embedding dtype {other:?}"),
+        }?;
+        let mut out_dims = ids.dims().to_vec();
+        out_dims.push(ncols);
+        out.reshape(out_dims)
+    }
+
+    fn embed<T: CudaDType + DeviceRepr>(
+        &self,
+        dev: &CudaDevice,
+        ids: &Tensor,
+        ncols: usize,
+        launcher: EmbeddingLauncher,
+    ) -> Result<Tensor> {
+        let Some(signs) = &self.signs else {
+            candle_core::bail!("PTQ1_0 CUDA path: embedding needs the inverse-fold signs");
+        };
+        let n_ids = ids.elem_count();
+        let stream = dev.cuda_stream();
+        let stream_ptr = stream.cu_stream() as *mut c_void;
+        let (ids_storage, ids_layout) = ids.storage_and_layout();
+        let (w_storage, w_layout) = self.blocks.storage_and_layout();
+        let (signs_storage, signs_layout) = signs.storage_and_layout();
+        let (ids_ptr, _ids_guard) =
+            cuda_ptr::<u32>(&ids_storage, ids_layout.start_offset(), &stream)?;
+        let (w_ptr, _w_guard) = cuda_ptr::<u8>(&w_storage, w_layout.start_offset(), &stream)?;
+        let (signs_ptr, _signs_guard) =
+            cuda_ptr::<f32>(&signs_storage, signs_layout.start_offset(), &stream)?;
+
+        let mut out = unsafe { dev.alloc::<T>(n_ids * ncols)? };
+        {
+            let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
+            unsafe {
+                launcher(
+                    ids_ptr as *const c_void,
+                    w_ptr as *const c_void,
+                    signs_ptr as *const c_void,
+                    out_ptr as *mut c_void,
+                    ncols as i32,
+                    n_ids as i32,
+                    stream_ptr,
+                );
+            }
+        }
+        let out_storage = CudaStorage::wrap_cuda_slice(out, dev.clone());
+        Ok(Tensor::from((
+            Storage::Cuda(out_storage),
+            Shape::from((n_ids, ncols)),
         )))
     }
 }

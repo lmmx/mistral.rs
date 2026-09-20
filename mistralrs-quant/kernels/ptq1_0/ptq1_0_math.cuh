@@ -103,6 +103,28 @@ PTQ1_0_HD int decode_step(uint32_t &v_lo, uint32_t &v_hi, uint32_t mult) {
   return static_cast<int>(sub_bytes(byte_perm(w_lo, w_hi, 0x7531), ONES));
 }
 
+// Weight `e` (0..127) of a block as -1, 0 or 1, following the packed element
+// order of the qs and qh bytes.
+PTQ1_0_HD int element_trit(const uint8_t *blk, int e) {
+  int byte;
+  int n;
+  if (e < NARROW_START) {
+    byte = e & 15;
+    n = e >> 4;
+  } else if (e < QH_START) {
+    byte = 16 + ((e - NARROW_START) & 7);
+    n = (e - NARROW_START) >> 3;
+  } else {
+    byte = 24 + ((e - QH_START) & 1);
+    n = (e - QH_START) >> 1;
+  }
+  uint32_t v = blk[byte];
+  for (int i = 0; i < n; ++i) {
+    v = (v * 3u) & 255u;
+  }
+  return static_cast<int>((v * 3u) >> 8) - 1;
+}
+
 #ifdef __CUDACC__
 static __device__ __forceinline__ float warp_sum(float x) {
 #pragma unroll

@@ -320,6 +320,10 @@ impl QuantMethod for Ptq1_0Linear {
     }
 
     fn embedding_forward(&self, ids: &Tensor, output_dtype: DType) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(gpu) = &self.gpu {
+            return gpu.embedding(ids, self.in_dim, output_dtype);
+        }
         Self::require_cpu(ids)?;
         let dims = ids.dims().to_vec();
         let flat = ids.to_dtype(DType::U32)?.flatten_all()?.to_vec1::<u32>()?;
@@ -393,6 +397,8 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    #[cfg(feature = "cuda")]
+    use crate::gguf::hadamard::HadamardRole;
     use crate::gguf::ptq1_0::encode_block;
 
     const LCG_MUL: u64 = 6364136223846793005;
@@ -490,7 +496,8 @@ mod tests {
         for (in_dim, tokens, folded) in cases {
             let out_dim = ROWS_PER_TASK * 2 + 5;
             let (bytes, x) = synthetic(out_dim, in_dim, tokens);
-            let transform = folded.then(|| RowTransform::fold_for_test(in_dim, 11, in_dim > 2048));
+            let transform = folded
+                .then(|| RowTransform::for_test(HadamardRole::Fold, in_dim, 11, in_dim > 2048));
             let gpu = PackedWeights::upload(&bytes, transform.as_ref(), &dev)?;
             for dtype in [DType::F32, DType::F16, DType::BF16] {
                 let input = Tensor::from_vec(x.clone(), (tokens, in_dim), &dev)?.to_dtype(dtype)?;
@@ -529,6 +536,45 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs a CUDA device"]
+    fn cuda_embedding_matches_cpu() -> Result<()> {
+        use crate::gguf::ptq1_0_cuda::PackedWeights;
+
+        let dev = Device::new_cuda(0)?;
+        let (vocab, width) = (50, 3072);
+        let (bytes, _) = synthetic(vocab, width, 1);
+        let transform = RowTransform::for_test(HadamardRole::Inverse, width, 5, false);
+        let gpu = PackedWeights::upload(&bytes, Some(&transform), &dev)?;
+        let ids = vec![3u32, 0, 49, 7, 7, 21];
+        let row_bytes = width / PTQ1_0_BLOCK_ELEMS * PTQ1_0_BLOCK_BYTES;
+        let mut want = Vec::new();
+        for id in &ids {
+            let mut row = vec![0f32; width];
+            let start = *id as usize * row_bytes;
+            dequantize_row(&bytes[start..start + row_bytes], &mut row);
+            transform.apply(&mut row, &mut Vec::new());
+            want.extend(row);
+        }
+        let input = Tensor::from_vec(ids, (2, 3), &dev)?;
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let got = gpu.embedding(&input, width, dtype)?;
+            assert_eq!(got.dims(), [2, 3, width]);
+            let got = got.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+            let norm = want.iter().map(|w| w * w).sum::<f32>().sqrt();
+            let err = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).powi(2))
+                .sum::<f32>()
+                .sqrt();
+            let tol = if dtype == DType::F32 { 1e-4 } else { 1e-2 };
+            assert!(err / norm < tol, "{dtype:?}: {}", err / norm);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs a CUDA device"]
     fn cuda_matmul_speed() -> Result<()> {
         use crate::gguf::ptq1_0_cuda::PackedWeights;
 
@@ -536,7 +582,7 @@ mod tests {
         let dev = Device::new_cuda(0)?;
         let (out_dim, in_dim) = (5120, 17408);
         let (bytes, _) = synthetic(out_dim, in_dim, 1);
-        let transform = RowTransform::fold_for_test(in_dim, 11, false);
+        let transform = RowTransform::for_test(HadamardRole::Fold, in_dim, 11, false);
         let gpu = PackedWeights::upload(&bytes, Some(&transform), &dev)?;
         for tokens in [1, 8, 59, 256] {
             let x = vec![0.5f32; tokens * in_dim];

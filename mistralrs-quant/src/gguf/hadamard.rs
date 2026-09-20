@@ -192,7 +192,7 @@ impl RowTransform {
     }
 
     #[cfg(all(test, feature = "cuda"))]
-    pub(crate) fn fold_for_test(width: usize, seed: u64, permute: bool) -> Self {
+    pub(crate) fn for_test(role: HadamardRole, width: usize, seed: u64, permute: bool) -> Self {
         let mut state = seed;
         let mut next = move || {
             state = state
@@ -211,17 +211,22 @@ impl RowTransform {
             order
         });
         Self {
-            role: HadamardRole::Fold,
+            role,
             block: CUDA_FWHT_BLOCK,
             signs: signs.into(),
             gather,
         }
     }
 
-    /// Whether the CUDA kernels can run this transform: fold role with a 1024-wide FWHT block.
+    /// Whether the CUDA kernels can run this transform: a 1024-wide FWHT block.
     #[cfg(feature = "cuda")]
     pub(crate) fn supports_cuda(&self) -> bool {
-        self.role == HadamardRole::Fold && self.block == CUDA_FWHT_BLOCK
+        self.block == CUDA_FWHT_BLOCK
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn is_inverse(&self) -> bool {
+        self.role == HadamardRole::Inverse
     }
 
     #[cfg(feature = "cuda")]
