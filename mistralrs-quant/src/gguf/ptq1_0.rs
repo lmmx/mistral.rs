@@ -19,21 +19,6 @@ pub(super) const fn trit(byte: u8, n: usize) -> u8 {
     ((q as u16 * 3) >> 8) as u8
 }
 
-/// `TRIT_LUT[n][byte]` is trit `n` of `byte` as a weight in -1..=1.
-static TRIT_LUT: [[i8; 256]; QS_TRITS_PER_BYTE] = {
-    let mut lut = [[0i8; 256]; QS_TRITS_PER_BYTE];
-    let mut n = 0;
-    while n < QS_TRITS_PER_BYTE {
-        let mut byte = 0;
-        while byte < 256 {
-            lut[n][byte] = trit(byte as u8, n) as i8 - 1;
-            byte += 1;
-        }
-        n += 1;
-    }
-    lut
-};
-
 /// Unpacks one block into trit codes 0..=2 (weight = code - 1), in element order.
 pub fn unpack_block_trits(block: &[u8], out: &mut [u8; PTQ1_0_BLOCK_ELEMS]) {
     debug_assert_eq!(block.len(), PTQ1_0_BLOCK_BYTES);
@@ -53,31 +38,6 @@ pub fn unpack_block_trits(block: &[u8], out: &mut [u8; PTQ1_0_BLOCK_ELEMS]) {
     for n in 0..QH_TRITS_PER_BYTE {
         for h in 0..QH_BYTES {
             out[o] = trit(block[QS_BYTES + h], n);
-            o += 1;
-        }
-    }
-}
-
-/// Same element order as `unpack_block_trits`, as weights in -1..=1.
-#[inline(always)]
-pub fn unpack_block_signed(block: &[u8], out: &mut [i8; PTQ1_0_BLOCK_ELEMS]) {
-    debug_assert_eq!(block.len(), PTQ1_0_BLOCK_BYTES);
-    let mut j = 0;
-    let mut o = 0;
-    for chunk in QS_STAGES {
-        while j + chunk <= QS_BYTES {
-            for lut in &TRIT_LUT {
-                for m in 0..chunk {
-                    out[o] = lut[block[j + m] as usize];
-                    o += 1;
-                }
-            }
-            j += chunk;
-        }
-    }
-    for lut in TRIT_LUT.iter().take(QH_TRITS_PER_BYTE) {
-        for h in 0..QH_BYTES {
-            out[o] = lut[block[QS_BYTES + h] as usize];
             o += 1;
         }
     }
@@ -197,20 +157,6 @@ mod tests {
         dequantize_row(&bytes, &mut y);
         assert!(y[..128].iter().all(|v| *v == 0.25));
         assert!(y[128..].iter().all(|v| *v == -2.0));
-    }
-
-    #[test]
-    fn signed_unpack_matches_trit_unpack() {
-        for seed in 0..8 {
-            let block = encode_block(&pattern(seed), 1.0);
-            let mut trits = [0u8; PTQ1_0_BLOCK_ELEMS];
-            let mut signed = [0i8; PTQ1_0_BLOCK_ELEMS];
-            unpack_block_trits(&block, &mut trits);
-            unpack_block_signed(&block, &mut signed);
-            for (t, s) in trits.iter().zip(signed) {
-                assert_eq!(*t as i8 - 1, s);
-            }
-        }
     }
 
     #[test]

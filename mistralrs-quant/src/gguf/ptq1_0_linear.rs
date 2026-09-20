@@ -11,7 +11,8 @@ use super::ptq1_0_cuda::PackedWeights;
 use super::{
     archive::GgufArchive,
     hadamard::RowTransform,
-    ptq1_0::{dequantize_row, trit, unpack_block_signed, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS},
+    ptq1_0::{dequantize_row, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS},
+    ptq1_0_cpu::packed_matmul,
 };
 use crate::{
     IsqPlanParams, IsqRequest, IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard,
@@ -89,178 +90,6 @@ impl Ptq1_0Linear {
         }
         Ok(())
     }
-}
-
-const DOT_LANES: usize = 16;
-const ROWS_PER_TASK: usize = 16;
-#[cfg(all(test, feature = "cuda"))]
-const CUDA_INT8_REL_ERR: f32 = 2e-2; // int8 activations, one scale per 128 columns
-const TOKEN_GROUP: usize = 4;
-const TOKEN_TILE: usize = 16;
-const K_TILE_BLOCKS: usize = 8;
-const FUSED_MAX_TOKENS: usize = 2; // above this, decoding each block once beats redoing it per token
-const QS_WIDE: usize = 16;
-const QS_NARROW: usize = 8;
-const QS_NARROW_START: usize = QS_WIDE * 5;
-const QH_START: usize = QS_NARROW_START + QS_NARROW * 5;
-
-type Lanes = [f32; DOT_LANES];
-
-/// Per-lane partial sums for `T` tokens against one f32-converted block, so each weight load feeds `T` FMAs.
-#[inline(always)]
-fn block_dot_tokens<const T: usize>(wf: &[f32; PTQ1_0_BLOCK_ELEMS], xs: [&[f32]; T]) -> [Lanes; T] {
-    let mut acc = [[0f32; DOT_LANES]; T];
-    for (k, w) in wf.as_chunks::<DOT_LANES>().0.iter().enumerate() {
-        let at = k * DOT_LANES;
-        for t in 0..T {
-            let x = &xs[t][at..at + DOT_LANES];
-            for i in 0..DOT_LANES {
-                acc[t][i] += w[i] * x[i];
-            }
-        }
-    }
-    acc
-}
-
-/// Unscaled dot of one packed block with `x`, decoding trits in lanes across the stage bytes.
-#[inline(always)]
-fn block_dot_fused(block: &[u8; PTQ1_0_BLOCK_BYTES], x: &[f32]) -> f32 {
-    let mut acc = [0f32; QS_WIDE];
-    for n in 0..5 {
-        for m in 0..QS_WIDE {
-            acc[m] += (trit(block[m], n) as i32 - 1) as f32 * x[n * QS_WIDE + m];
-        }
-    }
-    for n in 0..5 {
-        for m in 0..QS_NARROW {
-            let t = trit(block[QS_WIDE + m], n) as i32 - 1;
-            acc[m] += t as f32 * x[QS_NARROW_START + n * QS_NARROW + m];
-        }
-    }
-    for n in 0..4 {
-        for h in 0..2 {
-            let t = trit(block[QS_WIDE + QS_NARROW + h], n) as i32 - 1;
-            acc[h] += t as f32 * x[QH_START + n * 2 + h];
-        }
-    }
-    acc.iter().sum()
-}
-
-struct RowJob<'a> {
-    in_dim: usize,
-    tokens: usize,
-    xt: &'a [f32],
-}
-
-/// Accumulates `acc` (`rows x tokens`) for a chunk of weight rows, tiling so activations stay in L2.
-#[inline(always)]
-fn matmul_rows(lanes: &mut Vec<Lanes>, acc: &mut [f32], bytes: &[u8], job: &RowJob) {
-    let tokens = job.tokens;
-    let blocks_per_row = job.in_dim / PTQ1_0_BLOCK_ELEMS;
-    let row_bytes = blocks_per_row * PTQ1_0_BLOCK_BYTES;
-    let rows = acc.len() / tokens;
-    if tokens <= FUSED_MAX_TOKENS {
-        for (acc, row) in acc.chunks_mut(tokens).zip(bytes.chunks(row_bytes)) {
-            acc.fill(0.0);
-            for (b, block) in row.as_chunks::<PTQ1_0_BLOCK_BYTES>().0.iter().enumerate() {
-                let d = super::ptq1_0::block_scale(block);
-                for (t, a) in acc.iter_mut().enumerate() {
-                    let start = t * job.in_dim + b * PTQ1_0_BLOCK_ELEMS;
-                    *a += d * block_dot_fused(block, &job.xt[start..start + PTQ1_0_BLOCK_ELEMS]);
-                }
-            }
-        }
-        return;
-    }
-    lanes.clear();
-    lanes.resize(rows * tokens, [0f32; DOT_LANES]);
-    let mut tile = vec![[0i8; PTQ1_0_BLOCK_ELEMS]; rows * K_TILE_BLOCKS];
-    let mut scales = vec![0f32; rows * K_TILE_BLOCKS];
-    for k0 in (0..blocks_per_row).step_by(K_TILE_BLOCKS) {
-        let kn = K_TILE_BLOCKS.min(blocks_per_row - k0);
-        for r in 0..rows {
-            let row = &bytes[r * row_bytes..(r + 1) * row_bytes];
-            let blocks = &row.as_chunks::<PTQ1_0_BLOCK_BYTES>().0[k0..k0 + kn];
-            for (j, block) in blocks.iter().enumerate() {
-                unpack_block_signed(block, &mut tile[r * K_TILE_BLOCKS + j]);
-                scales[r * K_TILE_BLOCKS + j] = super::ptq1_0::block_scale(block);
-            }
-        }
-        for t0 in (0..tokens).step_by(TOKEN_TILE) {
-            let t_end = (t0 + TOKEN_TILE).min(tokens);
-            for r in 0..rows {
-                for j in 0..kn {
-                    let wf = tile[r * K_TILE_BLOCKS + j].map(|s| s as f32);
-                    let d = scales[r * K_TILE_BLOCKS + j];
-                    let at = (k0 + j) * PTQ1_0_BLOCK_ELEMS;
-                    let x_of = |t: usize| {
-                        let start = t * job.in_dim + at;
-                        &job.xt[start..start + PTQ1_0_BLOCK_ELEMS]
-                    };
-                    let row_lanes = &mut lanes[r * tokens..(r + 1) * tokens];
-                    let mut t = t0;
-                    while t + TOKEN_GROUP <= t_end {
-                        let xs = std::array::from_fn(|i| x_of(t + i));
-                        let part = block_dot_tokens::<TOKEN_GROUP>(&wf, xs);
-                        for (l, p) in row_lanes[t..t + TOKEN_GROUP].iter_mut().zip(part) {
-                            for (l, p) in l.iter_mut().zip(p) {
-                                *l += d * p;
-                            }
-                        }
-                        t += TOKEN_GROUP;
-                    }
-                    for (i, l) in row_lanes[t..t_end].iter_mut().enumerate() {
-                        let [part] = block_dot_tokens::<1>(&wf, [x_of(t + i)]);
-                        for (l, p) in l.iter_mut().zip(part) {
-                            *l += d * p;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for (a, l) in acc.iter_mut().zip(lanes.iter()) {
-        *a = l.iter().sum();
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn matmul_rows_avx2(lanes: &mut Vec<Lanes>, acc: &mut [f32], bytes: &[u8], job: &RowJob) {
-    matmul_rows(lanes, acc, bytes, job)
-}
-
-/// Returns `[tokens, out_dim]` for already-transformed activations `xt` of shape `[tokens, in_dim]`.
-fn packed_matmul(
-    bytes: &[u8],
-    out_dim: usize,
-    in_dim: usize,
-    xt: &[f32],
-    tokens: usize,
-) -> Vec<f32> {
-    let row_bytes = in_dim / PTQ1_0_BLOCK_ELEMS * PTQ1_0_BLOCK_BYTES;
-    #[cfg(target_arch = "x86_64")]
-    let avx2 = is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
-    let job = RowJob { in_dim, tokens, xt };
-    let mut by_row = vec![0f32; out_dim * tokens];
-    by_row
-        .par_chunks_mut(ROWS_PER_TASK * tokens)
-        .zip(bytes.par_chunks(ROWS_PER_TASK * row_bytes))
-        .for_each_init(Vec::new, |lanes, (acc, rows)| {
-            #[cfg(target_arch = "x86_64")]
-            if avx2 {
-                // SAFETY: avx2 and fma were detected at runtime above
-                return unsafe { matmul_rows_avx2(lanes, acc, rows, &job) };
-            }
-            matmul_rows(lanes, acc, rows, &job)
-        });
-    let mut out = vec![0f32; tokens * out_dim];
-    for (r, col) in by_row.chunks_exact(tokens).enumerate() {
-        for (t, v) in col.iter().enumerate() {
-            out[t * out_dim + r] = *v;
-        }
-    }
-    out
 }
 
 impl QuantMethod for Ptq1_0Linear {
@@ -396,11 +225,15 @@ impl QuantizedSerde for Ptq1_0Linear {
 mod tests {
     use std::time::Instant;
 
-    use super::*;
+    use super::{
+        super::ptq1_0_cpu::{K_TILE_BLOCKS, ROWS_PER_TASK, TOKEN_BLOCK, TOKEN_TILE},
+        *,
+    };
     #[cfg(feature = "cuda")]
     use crate::gguf::hadamard::HadamardRole;
     use crate::gguf::ptq1_0::encode_block;
 
+    const INT8_REL_ERR: f32 = 2e-2; // int8 activations, one scale per 128 columns
     const LCG_MUL: u64 = 6364136223846793005;
 
     fn lcg(state: &mut u64) -> u32 {
@@ -431,7 +264,7 @@ mod tests {
     fn packed_matmul_matches_dequantized_dense() {
         let wide = (K_TILE_BLOCKS + 3) * PTQ1_0_BLOCK_ELEMS;
         for in_dim in [3 * PTQ1_0_BLOCK_ELEMS, wide] {
-            for tokens in [1, FUSED_MAX_TOKENS + 1, TOKEN_TILE + TOKEN_GROUP + 1] {
+            for tokens in [1, 2, TOKEN_BLOCK + 1, TOKEN_TILE + TOKEN_BLOCK + 1] {
                 check_against_dense(in_dim, tokens);
             }
         }
@@ -445,18 +278,22 @@ mod tests {
             .zip(bytes.chunks(in_dim / PTQ1_0_BLOCK_ELEMS * PTQ1_0_BLOCK_BYTES))
             .for_each(|(d, s)| dequantize_row(s, d));
         let got = packed_matmul(&bytes, out_dim, in_dim, &x, tokens);
+        let (mut err, mut norm) = (0f32, 0f32);
         for t in 0..tokens {
             for r in 0..out_dim {
                 let want: f32 = (0..in_dim)
                     .map(|c| w[r * in_dim + c] * x[t * in_dim + c])
                     .sum();
                 let g = got[t * out_dim + r];
-                assert!(
-                    (g - want).abs() < 1e-3 * want.abs().max(1.0),
-                    "{g} vs {want}"
-                );
+                err += (g - want).powi(2);
+                norm += want.powi(2);
             }
         }
+        assert!(
+            err.sqrt() <= INT8_REL_ERR * norm.sqrt(),
+            "in_dim {in_dim} tokens {tokens}: rel err {}",
+            err.sqrt() / norm.sqrt()
+        );
     }
 
     #[test]
@@ -528,7 +365,7 @@ mod tests {
                     .sum::<f32>()
                     .sqrt();
                 assert!(
-                    err / norm < CUDA_INT8_REL_ERR,
+                    err / norm < INT8_REL_ERR,
                     "{dtype:?} in {in_dim} tokens {tokens} folded {folded}: {}",
                     err / norm
                 );
@@ -689,7 +526,7 @@ mod tests {
                     .sum::<f32>()
                     .sqrt();
                 assert!(
-                    err <= CUDA_INT8_REL_ERR * norm,
+                    err <= INT8_REL_ERR * norm,
                     "gemm differs from the lane kernel at {tokens} tokens: {}",
                     err / norm
                 );
