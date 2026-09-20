@@ -299,8 +299,14 @@ mod tests {
     #[test]
     #[ignore = "timing"]
     fn packed_matmul_speed() {
-        for tokens in [1, 16, 64, 256] {
-            let (out_dim, in_dim) = (5120, 17408);
+        // the last shape is ~156 MB of weights so it streams from DRAM instead of L3
+        for (out_dim, in_dim, tokens) in [
+            (5120, 17408, 1),
+            (5120, 17408, 16),
+            (5120, 17408, 64),
+            (5120, 17408, 256),
+            (40960, 17408, 1),
+        ] {
             let (bytes, x) = synthetic(out_dim, in_dim, tokens);
             packed_matmul(&bytes, out_dim, in_dim, &x, tokens);
             let start = Instant::now();
@@ -311,10 +317,39 @@ mod tests {
             let secs = start.elapsed().as_secs_f64() / reps as f64;
             let gbps = bytes.len() as f64 / secs / 1e9;
             eprintln!(
-                "tokens {tokens}: {:.1} ms, {gbps:.2} GB/s of weights",
+                "tokens {tokens} rows {out_dim}: {:.1} ms, {gbps:.2} GB/s of weights",
                 secs * 1e3
             );
         }
+        let (out_dim, in_dim) = (40960, 17408);
+        let (bytes, x) = synthetic(out_dim, in_dim, 1);
+        let path = std::env::temp_dir().join("ptq1_0_speed.bin");
+        std::fs::write(&path, &bytes).unwrap();
+        let map = unsafe { memmap2::Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap() };
+        packed_matmul(&map, out_dim, in_dim, &x, 1);
+        let start = Instant::now();
+        let reps = 5;
+        for _ in 0..reps {
+            std::hint::black_box(packed_matmul(&map, out_dim, in_dim, &x, 1));
+        }
+        let secs = start.elapsed().as_secs_f64() / reps as f64;
+        eprintln!(
+            "tokens 1 rows {out_dim} mmap: {:.1} ms, {:.2} GB/s of weights",
+            secs * 1e3,
+            bytes.len() as f64 / secs / 1e9
+        );
+        std::fs::remove_file(&path).ok();
+        let bytes = vec![1u8; 1 << 28];
+        let start = Instant::now();
+        let sum: u64 = bytes
+            .par_chunks(1 << 20)
+            .map(|c| c.iter().map(|b| *b as u64).sum::<u64>())
+            .sum();
+        let secs = start.elapsed().as_secs_f64();
+        eprintln!(
+            "memory read reference: {:.2} GB/s (sum {sum})",
+            bytes.len() as f64 / secs / 1e9
+        );
     }
 
     #[cfg(feature = "cuda")]
