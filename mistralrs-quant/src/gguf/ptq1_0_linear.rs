@@ -581,7 +581,9 @@ mod tests {
         const REPS: usize = 50;
         const UNSIGNED_FROM: i32 = 3;
         const UNSIGNED_REL_ERR: f32 = 5e-3;
-        const VARIANTS: [&str; 6] = ["pf2", "pf4", "pf8", "pf2 u", "pf4 u", "pf8 u"];
+        const VARIANTS: [&str; 8] = [
+            "pf2", "pf4", "pf8", "pf2 u", "pf4 u", "pf8 u", "bpl", "bpl u",
+        ];
         let dev = Device::new_cuda(0)?;
         let time = |f: &dyn Fn() -> Result<Tensor>| -> Result<f64> {
             f()?;
