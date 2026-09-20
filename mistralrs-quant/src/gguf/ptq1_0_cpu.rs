@@ -11,8 +11,8 @@ const VECS_PER_BLOCK: usize = PTQ1_0_BLOCK_ELEMS / VEC_BYTES;
 pub(super) const ROWS_PER_TASK: usize = 16;
 pub(super) const TOKEN_TILE: usize = 32;
 pub(super) const K_TILE_BLOCKS: usize = 8;
-const ROW_BLOCK: usize = 2;
-pub(super) const TOKEN_BLOCK: usize = 4;
+const ROW_BLOCK: usize = 4;
+pub(super) const TOKEN_BLOCK: usize = 2;
 
 type Elems<T> = [T; PTQ1_0_BLOCK_ELEMS];
 type Lane = [i32; LANES];
@@ -20,7 +20,7 @@ type Dots<const R: usize, const T: usize> = [[Lane; T]; R];
 
 /// Activations quantized to int8 with one scale (and one sum) per 128 columns, like the CUDA prepare kernel.
 struct Acts {
-    q: Vec<i8>,
+    q: Vec<Elems<i8>>,
     scales: Vec<f32>,
     sums: Vec<i32>,
     blocks_per_row: usize,
@@ -29,13 +29,13 @@ struct Acts {
 fn quantize(xt: &[f32], in_dim: usize) -> Acts {
     let n_blocks = xt.len() / PTQ1_0_BLOCK_ELEMS;
     let mut acts = Acts {
-        q: vec![0; xt.len()],
+        q: vec![[0; PTQ1_0_BLOCK_ELEMS]; n_blocks],
         scales: vec![0.0; n_blocks],
         sums: vec![0; n_blocks],
         blocks_per_row: in_dim / PTQ1_0_BLOCK_ELEMS,
     };
     xt.par_chunks(PTQ1_0_BLOCK_ELEMS)
-        .zip(acts.q.par_chunks_mut(PTQ1_0_BLOCK_ELEMS))
+        .zip(acts.q.par_iter_mut())
         .zip(acts.scales.par_iter_mut().zip(acts.sums.par_iter_mut()))
         .for_each(|((x, q), (scale, sum))| {
             let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -103,16 +103,11 @@ mod avx2 {
     const QS_WIDE_END: usize = 16;
     const QS_NARROW_END: usize = 24;
     const QH_START: usize = 24;
-    const TRIT_BYTE_MASK: i16 = 0xFF;
 
-    /// Trit `n` of each byte lane, given `pow3 = 3^n` per lane.
+    /// Trit `n` of each byte lane, given `pow3 = 3^n << 8` per lane: the low product byte lands in the high half.
     #[inline(always)]
     unsafe fn trits(bytes: __m256i, pow3: __m256i) -> __m256i {
-        let low = _mm256_and_si256(
-            _mm256_mullo_epi16(bytes, pow3),
-            _mm256_set1_epi16(TRIT_BYTE_MASK),
-        );
-        _mm256_srli_epi16::<8>(_mm256_mullo_epi16(low, _mm256_set1_epi16(3)))
+        _mm256_mulhi_epu16(_mm256_mullo_epi16(bytes, pow3), _mm256_set1_epi16(3))
     }
 
     /// Packs two 16 x u16 vectors into 32 in-order bytes.
@@ -131,7 +126,7 @@ mod avx2 {
         unsafe fn decode(block: &[u8; PTQ1_0_BLOCK_BYTES], out: &mut Elems<u8>) {
             let p = block.as_ptr();
             let wide = _mm256_cvtepu8_epi16(_mm_loadu_si128(p as *const __m128i));
-            let pow = |n: i16| _mm256_set1_epi16(3i16.pow(n as u32));
+            let pow = |n: i16| _mm256_set1_epi16(3i16.pow(n as u32) << 8);
             let w = |n| trits(wide, pow(n));
             store(out, 0, pack(w(0), w(1)));
             store(out, 1, pack(w(2), w(3)));
@@ -143,8 +138,8 @@ mod avx2 {
                     lo, lo, lo, lo, lo, lo, lo, lo, hi, hi, hi, hi, hi, hi, hi, hi,
                 )
             };
-            let n01 = trits(narrow16, lanes8(1, 3));
-            let n23 = trits(narrow16, lanes8(9, 27));
+            let n01 = trits(narrow16, lanes8(1 << 8, 3 << 8));
+            let n23 = trits(narrow16, lanes8(9 << 8, 27 << 8));
             store(out, 2, pack(w(4), n01));
 
             let qh = p.add(QH_START);
@@ -154,8 +149,24 @@ mod avx2 {
                 _mm_setr_epi8(0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0),
             );
             let tail = _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(narrow, qh8));
-            let tail_pow =
-                _mm256_setr_epi16(81, 81, 81, 81, 81, 81, 81, 81, 1, 1, 3, 3, 9, 9, 27, 27);
+            let tail_pow = _mm256_setr_epi16(
+                81 << 8,
+                81 << 8,
+                81 << 8,
+                81 << 8,
+                81 << 8,
+                81 << 8,
+                81 << 8,
+                81 << 8,
+                1 << 8,
+                1 << 8,
+                3 << 8,
+                3 << 8,
+                9 << 8,
+                9 << 8,
+                27 << 8,
+                27 << 8,
+            );
             store(out, 3, pack(n23, trits(tail, tail_pow)));
             debug_assert_eq!(QS_NARROW_END, QH_START);
         }
@@ -232,20 +243,32 @@ unsafe fn micro<K: Int8Kernel, const R: usize, const T: usize>(
     let mut a: [[[f32; LANES]; T]; R] =
         std::array::from_fn(|r| std::array::from_fn(|i| acc[at(r, i)]));
     let bpr = cx.acts.blocks_per_row;
-    for j in 0..cx.kn {
-        let ts: [&Elems<u8>; R] = std::array::from_fn(|r| &cx.tile[(r0 + r) * K_TILE_BLOCKS + j]);
-        let x_block = |i: usize| (cx.token_base + t0 + i) * bpr + cx.k0 + j;
-        let xs: [&Elems<i8>; T] = std::array::from_fn(|i| {
-            let start = x_block(i) * PTQ1_0_BLOCK_ELEMS;
-            <&Elems<i8>>::try_from(&cx.acts.q[start..start + PTQ1_0_BLOCK_ELEMS]).unwrap()
-        });
-        let dots = K::dot(ts, xs);
+    let kn = cx.kn;
+    let ts: [&[Elems<u8>]; R] = std::array::from_fn(|r| {
+        let start = (r0 + r) * K_TILE_BLOCKS;
+        &cx.tile[start..start + kn]
+    });
+    let wscales: [&[f32]; R] = std::array::from_fn(|r| {
+        let start = (r0 + r) * K_TILE_BLOCKS;
+        &cx.scales[start..start + kn]
+    });
+    let span = |i: usize| {
+        let start = (cx.token_base + t0 + i) * bpr + cx.k0;
+        start..start + kn
+    };
+    let xq: [&[Elems<i8>]; T] = std::array::from_fn(|i| &cx.acts.q[span(i)]);
+    let xscales: [&[f32]; T] = std::array::from_fn(|i| &cx.acts.scales[span(i)]);
+    let xsums: [&[i32]; T] = std::array::from_fn(|i| &cx.acts.sums[span(i)]);
+    for j in 0..kn {
+        let dots = K::dot::<R, T>(
+            std::array::from_fn(|r| &ts[r][j]),
+            std::array::from_fn(|i| &xq[i][j]),
+        );
         for r in 0..R {
             for i in 0..T {
-                let b = x_block(i);
-                let scale = cx.scales[(r0 + r) * K_TILE_BLOCKS + j] * cx.acts.scales[b];
+                let scale = wscales[r][j] * xscales[i][j];
                 let mut lanes = dots[r][i];
-                lanes[0] -= cx.acts.sums[b]; // (t - 1) * x = t * x - x
+                lanes[0] -= xsums[i][j]; // (t - 1) * x = t * x - x
                 for l in 0..LANES {
                     a[r][i][l] = scale.mul_add(lanes[l] as f32, a[r][i][l]);
                 }
@@ -301,7 +324,7 @@ unsafe fn matmul_rows<K: Int8Kernel>(
             };
             let mut r = 0;
             while r < rows {
-                let rb = ROW_BLOCK.min(rows - r);
+                let rb = if rows - r >= ROW_BLOCK { ROW_BLOCK } else { 1 };
                 let mut t = 0;
                 while t < width {
                     let tb = if width - t >= TOKEN_BLOCK {
