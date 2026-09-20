@@ -531,4 +531,78 @@ mod tests {
             }
         }
     }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[ignore = "timing"]
+    fn machine_ceilings() {
+        use std::{arch::x86_64::*, time::Instant};
+
+        const READ_BYTES: usize = 1 << 29;
+        const READ_REPS: usize = 6;
+        const PEAK_ITERS: usize = 1 << 24;
+        const PEAK_CHAINS: usize = 8;
+        const MACS_PER_MADDUBS: f64 = 32.0;
+
+        #[target_feature(enable = "avx2")]
+        unsafe fn read_chunk(chunk: &[u8]) -> i32 {
+            let mut acc = _mm256_setzero_si256();
+            for c in chunk.as_chunks::<256>().0 {
+                let p = c.as_ptr() as *const __m256i;
+                for i in 0..8 {
+                    acc = _mm256_xor_si256(acc, _mm256_loadu_si256(p.add(i)));
+                }
+            }
+            _mm256_extract_epi32::<0>(acc)
+        }
+
+        #[target_feature(enable = "avx2")]
+        unsafe fn peak_chain(seed: i8) -> i32 {
+            let a = _mm256_set1_epi8(seed);
+            let b = _mm256_set1_epi8(seed.wrapping_add(1));
+            let mut acc = [_mm256_setzero_si256(); PEAK_CHAINS];
+            for _ in 0..PEAK_ITERS {
+                for c in acc.iter_mut() {
+                    *c = _mm256_add_epi16(*c, _mm256_maddubs_epi16(std::hint::black_box(a), b));
+                }
+            }
+            let mut sum = _mm256_setzero_si256();
+            for c in acc {
+                sum = _mm256_add_epi16(sum, c);
+            }
+            _mm256_extract_epi32::<0>(sum)
+        }
+
+        if Backend::detect() != Backend::Avx2 {
+            return;
+        }
+        let threads = rayon::current_num_threads();
+        let data = vec![1u8; READ_BYTES];
+        let chunk = READ_BYTES / threads;
+        let mut best_read = 0f64;
+        for _ in 0..READ_REPS {
+            let start = Instant::now();
+            // SAFETY: avx2 detected above
+            let sink: i32 = data
+                .par_chunks(chunk)
+                .map(|c| unsafe { read_chunk(c) })
+                .sum();
+            std::hint::black_box(sink);
+            best_read = best_read.max(READ_BYTES as f64 / start.elapsed().as_secs_f64() / 1e9);
+        }
+        let start = Instant::now();
+        // SAFETY: avx2 detected above
+        let sink: i32 = (0..threads)
+            .into_par_iter()
+            .map(|t| unsafe { peak_chain(t as i8) })
+            .sum();
+        std::hint::black_box(sink);
+        let macs = threads as f64 * PEAK_ITERS as f64 * PEAK_CHAINS as f64 * MACS_PER_MADDUBS;
+        eprintln!("ceiling read GB/s: {best_read:.1}");
+        eprintln!(
+            "ceiling int8 GMAC/s: {:.0}",
+            macs / start.elapsed().as_secs_f64() / 1e9
+        );
+        eprintln!("ceiling threads: {threads}");
+    }
 }
