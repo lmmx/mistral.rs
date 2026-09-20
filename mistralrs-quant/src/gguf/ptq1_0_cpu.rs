@@ -9,8 +9,8 @@ const LANES: usize = 8;
 const VEC_BYTES: usize = 32;
 const VECS_PER_BLOCK: usize = PTQ1_0_BLOCK_ELEMS / VEC_BYTES;
 pub(super) const ROWS_PER_TASK: usize = 16;
-pub(super) const TOKEN_TILE: usize = 16;
-pub(super) const K_TILE_BLOCKS: usize = 4;
+pub(super) const TOKEN_TILE: usize = 32;
+pub(super) const K_TILE_BLOCKS: usize = 8;
 const ROW_BLOCK: usize = 2;
 pub(super) const TOKEN_BLOCK: usize = 4;
 
@@ -193,7 +193,6 @@ struct Scratch {
     tile: Vec<Elems<u8>>,
     scales: Vec<f32>,
     acc: Vec<[f32; LANES]>,
-    corr: Vec<f32>,
 }
 
 impl Scratch {
@@ -202,7 +201,6 @@ impl Scratch {
             tile: Vec::new(),
             scales: Vec::new(),
             acc: Vec::new(),
-            corr: Vec::new(),
         }
     }
 }
@@ -228,13 +226,11 @@ fn reduce(lanes: &[f32; LANES]) -> f32 {
 unsafe fn micro<K: Int8Kernel, const R: usize, const T: usize>(
     cx: &TileCtx,
     acc: &mut [[f32; LANES]],
-    corr: &mut [f32],
     (r0, t0): (usize, usize),
 ) {
     let at = |r: usize, i: usize| (r0 + r) * cx.token_width + t0 + i;
     let mut a: [[[f32; LANES]; T]; R] =
         std::array::from_fn(|r| std::array::from_fn(|i| acc[at(r, i)]));
-    let mut c: [[f32; T]; R] = std::array::from_fn(|r| std::array::from_fn(|i| corr[at(r, i)]));
     let bpr = cx.acts.blocks_per_row;
     for j in 0..cx.kn {
         let ts: [&Elems<u8>; R] = std::array::from_fn(|r| &cx.tile[(r0 + r) * K_TILE_BLOCKS + j]);
@@ -248,17 +244,17 @@ unsafe fn micro<K: Int8Kernel, const R: usize, const T: usize>(
             for i in 0..T {
                 let b = x_block(i);
                 let scale = cx.scales[(r0 + r) * K_TILE_BLOCKS + j] * cx.acts.scales[b];
+                let mut lanes = dots[r][i];
+                lanes[0] -= cx.acts.sums[b]; // (t - 1) * x = t * x - x
                 for l in 0..LANES {
-                    a[r][i][l] += scale * dots[r][i][l] as f32;
+                    a[r][i][l] = scale.mul_add(lanes[l] as f32, a[r][i][l]);
                 }
-                c[r][i] += scale * cx.acts.sums[b] as f32;
             }
         }
     }
     for r in 0..R {
         for i in 0..T {
             acc[at(r, i)] = a[r][i];
-            corr[at(r, i)] = c[r][i];
         }
     }
 }
@@ -282,8 +278,6 @@ unsafe fn matmul_rows<K: Int8Kernel>(
         let width = TOKEN_TILE.min(tokens - token_base);
         sc.acc.clear();
         sc.acc.resize(rows * width, [0.0; LANES]);
-        sc.corr.clear();
-        sc.corr.resize(rows * width, 0.0);
         for k0 in (0..bpr).step_by(K_TILE_BLOCKS) {
             let kn = K_TILE_BLOCKS.min(bpr - k0);
             for r in 0..rows {
@@ -318,15 +312,11 @@ unsafe fn matmul_rows<K: Int8Kernel>(
                     let at = (r, t);
                     match (rb, tb) {
                         (ROW_BLOCK, TOKEN_BLOCK) => {
-                            micro::<K, ROW_BLOCK, TOKEN_BLOCK>(&cx, &mut sc.acc, &mut sc.corr, at)
+                            micro::<K, ROW_BLOCK, TOKEN_BLOCK>(&cx, &mut sc.acc, at)
                         }
-                        (ROW_BLOCK, _) => {
-                            micro::<K, ROW_BLOCK, 1>(&cx, &mut sc.acc, &mut sc.corr, at)
-                        }
-                        (_, TOKEN_BLOCK) => {
-                            micro::<K, 1, TOKEN_BLOCK>(&cx, &mut sc.acc, &mut sc.corr, at)
-                        }
-                        _ => micro::<K, 1, 1>(&cx, &mut sc.acc, &mut sc.corr, at),
+                        (ROW_BLOCK, _) => micro::<K, ROW_BLOCK, 1>(&cx, &mut sc.acc, at),
+                        (_, TOKEN_BLOCK) => micro::<K, 1, TOKEN_BLOCK>(&cx, &mut sc.acc, at),
+                        _ => micro::<K, 1, 1>(&cx, &mut sc.acc, at),
                     }
                     t += tb;
                 }
@@ -335,15 +325,14 @@ unsafe fn matmul_rows<K: Int8Kernel>(
         }
         for r in 0..rows {
             for t in 0..width {
-                out[r * tokens + token_base + t] =
-                    reduce(&sc.acc[r * width + t]) - sc.corr[r * width + t];
+                out[r * tokens + token_base + t] = reduce(&sc.acc[r * width + t]);
             }
         }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn matmul_rows_avx2(
     sc: &mut Scratch,
     out: &mut [f32],
@@ -364,7 +353,7 @@ pub(super) enum Backend {
 impl Backend {
     pub(super) fn detect() -> Self {
         #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("avx2") {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return Self::Avx2;
         }
         Self::Scalar
