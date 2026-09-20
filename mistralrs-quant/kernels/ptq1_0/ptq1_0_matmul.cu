@@ -16,6 +16,7 @@
 #define BLOCKS_PER_WARP_STEP 4 // 4 blocks x 7 words fill 28 of 32 lanes
 #define BPL_LANES_PER_ROW 8 // K / 128 is a multiple of 8 for folded weights
 #define BPL_ROWS_PER_WARP (WARP_SIZE / BPL_LANES_PER_ROW)
+#define BPL_MAX_TOKENS 1
 #define SCALE_WORD (ptq1_0::BLOCK_WORDS - 1) // scale is in its top half
 #define FWHT_SCALE 0.03125f    // 1 / sqrt(FWHT_BLOCK)
 #define INT8_MAX_F 127.0f
@@ -385,11 +386,11 @@ static void ptq1_0_launch_lanes(const void *x, const void *w,
   }
 }
 
-template <typename T>
-static void ptq1_0_launch(const void *x, const void *w, const void *signs,
-                          const void *gather, void *scratch, void *dst,
-                          int ncols_x, int nrows_x, int b_size, int do_fwht,
-                          void *stream) {
+template <typename T, int TT>
+static void ptq1_0_launch_bpl(const void *x, const void *w, const void *signs,
+                              const void *gather, void *scratch, void *dst,
+                              int ncols_x, int nrows_x, int b_size,
+                              int do_fwht, void *stream) {
   cudaStream_t s = static_cast<cudaStream_t>(stream);
   ptq1_0_prepare_launch<T>(x, signs, gather, scratch, ncols_x, b_size, do_fwht,
                            s);
@@ -399,16 +400,25 @@ static void ptq1_0_launch(const void *x, const void *w, const void *signs,
   const int block = MATMUL_WARPS * WARP_SIZE;
   const int rows_per_cta = MATMUL_WARPS * BPL_ROWS_PER_WARP;
   const unsigned int row_blocks = (nrows_x + rows_per_cta - 1) / rows_per_cta;
-  const uint32_t *wp = static_cast<const uint32_t *>(w);
-  if (b_size == 1) {
-    ptq1_0_matmul_bpl_kernel<T, 1><<<dim3(row_blocks, 1, 1), block, 0, s>>>(
-        wp, xq, xscale, static_cast<T *>(dst), ncols_x, nrows_x, b_size);
+  const unsigned int passes = (b_size + TT - 1) / TT;
+  ptq1_0_matmul_bpl_kernel<T, TT><<<dim3(row_blocks, passes, 1), block, 0, s>>>(
+      static_cast<const uint32_t *>(w), xq, xscale, static_cast<T *>(dst),
+      ncols_x, nrows_x, b_size);
+}
+
+// The thread-per-block kernel wins for single-token decode; with several
+// tokens per pass its per-thread state costs more than it saves.
+template <typename T>
+static void ptq1_0_launch(const void *x, const void *w, const void *signs,
+                          const void *gather, void *scratch, void *dst,
+                          int ncols_x, int nrows_x, int b_size, int do_fwht,
+                          void *stream) {
+  if (b_size <= BPL_MAX_TOKENS) {
+    ptq1_0_launch_bpl<T, 1>(x, w, signs, gather, scratch, dst, ncols_x,
+                            nrows_x, b_size, do_fwht, stream);
   } else {
-    const unsigned int passes =
-        (b_size + MATMUL_TOKENS_PER_PASS - 1) / MATMUL_TOKENS_PER_PASS;
-    ptq1_0_matmul_bpl_kernel<T, MATMUL_TOKENS_PER_PASS>
-        <<<dim3(row_blocks, passes, 1), block, 0, s>>>(
-            wp, xq, xscale, static_cast<T *>(dst), ncols_x, nrows_x, b_size);
+    ptq1_0_launch_lanes<T>(x, w, signs, gather, scratch, dst, ncols_x, nrows_x,
+                           b_size, do_fwht, stream);
   }
 }
 
@@ -476,16 +486,34 @@ PTQ1_0_EMBEDDING_LAUNCHER(f32, float)
 PTQ1_0_EMBEDDING_LAUNCHER(f16, __half)
 PTQ1_0_EMBEDDING_LAUNCHER(bf16, __nv_bfloat16)
 
-// Benchmark entry: variant 0 is the lane-role kernel, 1 the production one.
+// Benchmark entry: 0 lane-role kernel, 1/2/3 thread-per-block with 1/2/4
+// tokens per pass, anything else the production dispatch.
 extern "C" void launch_ptq1_0_matmul_variant_bf16(
     const void *x, const void *w, const void *signs, const void *gather,
     void *scratch, void *dst, int ncols_x, int nrows_x, int b_size,
     int do_fwht, int variant, void *stream) {
-  if (variant == 0) {
+  switch (variant) {
+  case 0:
     ptq1_0_launch_lanes<__nv_bfloat16>(x, w, signs, gather, scratch, dst,
                                        ncols_x, nrows_x, b_size, do_fwht,
                                        stream);
-  } else {
+    break;
+  case 1:
+    ptq1_0_launch_bpl<__nv_bfloat16, 1>(x, w, signs, gather, scratch, dst,
+                                        ncols_x, nrows_x, b_size, do_fwht,
+                                        stream);
+    break;
+  case 2:
+    ptq1_0_launch_bpl<__nv_bfloat16, 2>(x, w, signs, gather, scratch, dst,
+                                        ncols_x, nrows_x, b_size, do_fwht,
+                                        stream);
+    break;
+  case 3:
+    ptq1_0_launch_bpl<__nv_bfloat16, 4>(x, w, signs, gather, scratch, dst,
+                                        ncols_x, nrows_x, b_size, do_fwht,
+                                        stream);
+    break;
+  default:
     ptq1_0_launch<__nv_bfloat16>(x, w, signs, gather, scratch, dst, ncols_x,
                                  nrows_x, b_size, do_fwht, stream);
   }

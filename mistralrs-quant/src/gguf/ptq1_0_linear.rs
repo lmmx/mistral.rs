@@ -580,9 +580,7 @@ mod tests {
 
         const REPS: usize = 50;
         const VARIANT_REL_ERR: f32 = 5e-3;
-        const VARIANTS: [&str; 8] = [
-            "pf2", "pf4", "pf8", "pf2 u", "pf4 u", "pf8 u", "bpl", "bpl u",
-        ];
+        const VARIANTS: [&str; 2] = ["lanes", "bpl"];
         let dev = Device::new_cuda(0)?;
         let time = |f: &dyn Fn() -> Result<Tensor>| -> Result<f64> {
             f()?;
@@ -639,6 +637,26 @@ mod tests {
                 bytes.len() as f64 / 1e6,
                 row.join(" ")
             );
+        }
+
+        eprintln!("token sweep, ms per matmul; lanes | bpl 1 token per pass | bpl 2 | bpl 4");
+        for (out_dim, in_dim) in [(17408, 5120), (5120, 17408)] {
+            let (bytes, _) = synthetic(out_dim, in_dim, 1);
+            let transform = RowTransform::for_test(HadamardRole::Fold, in_dim, 11, false);
+            let gpu = PackedWeights::upload(&bytes, Some(&transform), &dev)?;
+            for tokens in [1, 2, 3, 4, 6, 8, 16] {
+                let x = vec![0.5f32; tokens * in_dim];
+                let input = Tensor::from_vec(x, (tokens, in_dim), &dev)?.to_dtype(DType::BF16)?;
+                let mut cells = Vec::new();
+                for variant in 0..4 {
+                    let secs = time(&|| gpu.matmul_variant(&input, out_dim, variant))?;
+                    cells.push(format!("{:6.3}", secs * 1e3));
+                }
+                eprintln!(
+                    "{out_dim:>6} x {in_dim:<5} tokens {tokens:>2}: {}",
+                    cells.join(" | ")
+                );
+            }
         }
 
         let (out_dim, in_dim) = (5120, 17408);
