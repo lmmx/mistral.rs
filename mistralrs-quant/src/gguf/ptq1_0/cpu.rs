@@ -1,10 +1,13 @@
-//! Int8-activation CPU matmul over packed PTQ1_0 rows: a scalar reference and an AVX2 kernel that agree bit for bit.
+//! Int8-activation CPU matmul over packed PTQ1_0 or PQ2_0 rows: a scalar reference and an AVX2 kernel that agree bit for bit.
 
 use std::cell::RefCell;
 
 use rayon::prelude::*;
 
-use super::{block_scale, unpack_block_trits, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS};
+use super::{
+    block_scale, unpack_block_trits, PackedFormat, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS,
+};
+use crate::gguf::pq2_0::{self, PQ2_0_BLOCK_BYTES};
 
 const INT8_MAX_F: f32 = 127.0;
 const LANES: usize = 8;
@@ -68,11 +71,13 @@ fn quantize(xt: &[f32], in_dim: usize) -> Acts {
 }
 
 /// Lane `l` of `dot` sums bytes `4l..4l+4` of each 32-byte vector, the layout `maddubs` then `madd` produce.
+/// The decoders write unsigned codes in element order (weight = code - 1).
 ///
 /// # Safety
-/// `decode` and `dot` may use CPU features the caller must have verified.
+/// `decode_*` and `dot` may use CPU features the caller must have verified.
 unsafe trait Int8Kernel {
-    unsafe fn decode(block: &[u8; PTQ1_0_BLOCK_BYTES], out: &mut Elems<u8>);
+    unsafe fn decode_ptq1_0(block: &[u8; PTQ1_0_BLOCK_BYTES], out: &mut Elems<u8>);
+    unsafe fn decode_pq2_0(block: &[u8; PQ2_0_BLOCK_BYTES], out: &mut Elems<u8>);
     unsafe fn dot<const R: usize, const T: usize>(
         ts: [&Elems<u8>; R],
         xs: [&Elems<i8>; T],
@@ -83,8 +88,13 @@ struct Scalar;
 
 unsafe impl Int8Kernel for Scalar {
     #[inline(always)]
-    unsafe fn decode(block: &[u8; PTQ1_0_BLOCK_BYTES], out: &mut Elems<u8>) {
+    unsafe fn decode_ptq1_0(block: &[u8; PTQ1_0_BLOCK_BYTES], out: &mut Elems<u8>) {
         unpack_block_trits(block, out);
+    }
+
+    #[inline(always)]
+    unsafe fn decode_pq2_0(block: &[u8; PQ2_0_BLOCK_BYTES], out: &mut Elems<u8>) {
+        pq2_0::unpack_block_codes(block, out);
     }
 
     #[inline(always)]
@@ -113,9 +123,11 @@ mod avx2 {
     use std::arch::x86_64::*;
 
     use super::{
-        Avx2, Dots, Elems, Int8Kernel, LANES, PTQ1_0_BLOCK_BYTES, VECS_PER_BLOCK, VEC_BYTES,
+        Avx2, Dots, Elems, Int8Kernel, LANES, PQ2_0_BLOCK_BYTES, PTQ1_0_BLOCK_BYTES,
+        VECS_PER_BLOCK, VEC_BYTES,
     };
 
+    const PQ2_0_SCALE_BYTES: usize = 2;
     const QS_WIDE_END: usize = 16;
     const QS_NARROW_END: usize = 24;
     const QH_START: usize = 24;
@@ -139,7 +151,32 @@ mod avx2 {
 
     unsafe impl Int8Kernel for Avx2 {
         #[inline(always)]
-        unsafe fn decode(block: &[u8; PTQ1_0_BLOCK_BYTES], out: &mut Elems<u8>) {
+        unsafe fn decode_pq2_0(block: &[u8; PQ2_0_BLOCK_BYTES], out: &mut Elems<u8>) {
+            // Byte n of the 32 code bytes holds elements 4n..4n+4, low bits first. Each vector covers 8 of those
+            // bytes: spread every byte over four lanes, then lane 4n+k keeps bits 2k..2k+2 of it.
+            let spread = _mm256_setr_epi8(
+                0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6,
+                7, 7, 7, 7,
+            );
+            let lane_mask = |k: u32| _mm256_set1_epi32(0x03 << (8 * k));
+            let qs = block.as_ptr().add(PQ2_0_SCALE_BYTES);
+            for v in 0..VECS_PER_BLOCK {
+                let eight = _mm_loadl_epi64(qs.add(v * 8) as *const __m128i);
+                let s = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(eight), spread);
+                let k0 = _mm256_and_si256(s, lane_mask(0));
+                let k1 = _mm256_and_si256(_mm256_srli_epi16::<2>(s), lane_mask(1));
+                let k2 = _mm256_and_si256(_mm256_srli_epi16::<4>(s), lane_mask(2));
+                let k3 = _mm256_and_si256(_mm256_srli_epi16::<6>(s), lane_mask(3));
+                store(
+                    out,
+                    v,
+                    _mm256_or_si256(_mm256_or_si256(k0, k1), _mm256_or_si256(k2, k3)),
+                );
+            }
+        }
+
+        #[inline(always)]
+        unsafe fn decode_ptq1_0(block: &[u8; PTQ1_0_BLOCK_BYTES], out: &mut Elems<u8>) {
             let p = block.as_ptr();
             let wide = _mm256_cvtepu8_epi16(_mm_loadu_si128(p as *const __m128i));
             let pow = |n: i16| _mm256_set1_epi16(3i16.pow(n as u32) << 8);
@@ -320,6 +357,7 @@ unsafe fn micro<K: Int8Kernel, const R: usize, const T: usize>(
 /// Fills `out` (`rows x tokens`, tokens fastest) for a chunk of weight rows.
 #[inline(always)]
 unsafe fn matmul_rows<K: Int8Kernel>(
+    format: PackedFormat,
     sc: &mut Scratch,
     out: &mut [f32],
     bytes: &[u8],
@@ -327,7 +365,8 @@ unsafe fn matmul_rows<K: Int8Kernel>(
     tokens: usize,
 ) {
     let bpr = acts.blocks_per_row;
-    let row_bytes = bpr * PTQ1_0_BLOCK_BYTES;
+    let block_bytes = format.block_bytes();
+    let row_bytes = bpr * block_bytes;
     let rows = out.len() / tokens;
     sc.tile
         .resize(rows * K_TILE_BLOCKS, [0; PTQ1_0_BLOCK_ELEMS]);
@@ -343,11 +382,19 @@ unsafe fn matmul_rows<K: Int8Kernel>(
             for r in 0..rows {
                 let row = &bytes[r * row_bytes..(r + 1) * row_bytes];
                 for j in 0..kn {
-                    let start = (k0 + j) * PTQ1_0_BLOCK_BYTES;
-                    let block: &[u8; PTQ1_0_BLOCK_BYTES] =
-                        row[start..start + PTQ1_0_BLOCK_BYTES].try_into().unwrap();
-                    K::decode(block, &mut sc.tile[r * K_TILE_BLOCKS + j]);
-                    sc.scales[r * K_TILE_BLOCKS + j] = block_scale(block);
+                    let start = (k0 + j) * block_bytes;
+                    let block = &row[start..start + block_bytes];
+                    let tile = &mut sc.tile[r * K_TILE_BLOCKS + j];
+                    sc.scales[r * K_TILE_BLOCKS + j] = match format {
+                        PackedFormat::Ptq1_0 => {
+                            K::decode_ptq1_0(block.try_into().unwrap(), tile);
+                            block_scale(block)
+                        }
+                        PackedFormat::Pq2_0 => {
+                            K::decode_pq2_0(block.try_into().unwrap(), tile);
+                            pq2_0::block_scale(block)
+                        }
+                    };
                 }
             }
             sc.xscales.clear();
@@ -412,13 +459,14 @@ unsafe fn matmul_rows<K: Int8Kernel>(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn matmul_rows_avx2(
+    format: PackedFormat,
     sc: &mut Scratch,
     out: &mut [f32],
     bytes: &[u8],
     acts: &Acts,
     tokens: usize,
 ) {
-    matmul_rows::<Avx2>(sc, out, bytes, acts, tokens)
+    matmul_rows::<Avx2>(format, sc, out, bytes, acts, tokens)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -440,33 +488,43 @@ impl Backend {
 
 /// Returns `[tokens, out_dim]` for already-transformed activations `xt` of shape `[tokens, in_dim]`.
 pub(super) fn packed_matmul(
+    format: PackedFormat,
     bytes: &[u8],
     out_dim: usize,
     in_dim: usize,
     xt: &[f32],
     tokens: usize,
 ) -> Vec<f32> {
-    packed_matmul_with(Backend::detect(), bytes, out_dim, in_dim, xt, tokens)
+    packed_matmul_with(
+        Backend::detect(),
+        format,
+        bytes,
+        out_dim,
+        in_dim,
+        xt,
+        tokens,
+    )
 }
 
 pub(super) fn packed_matmul_with(
     backend: Backend,
+    format: PackedFormat,
     bytes: &[u8],
     out_dim: usize,
     in_dim: usize,
     xt: &[f32],
     tokens: usize,
 ) -> Vec<f32> {
-    let row_bytes = in_dim / PTQ1_0_BLOCK_ELEMS * PTQ1_0_BLOCK_BYTES;
+    let row_bytes = in_dim / PTQ1_0_BLOCK_ELEMS * format.block_bytes();
     let acts = quantize(xt, in_dim);
     let mut by_row = vec![0f32; out_dim * tokens];
     let run_rows = |sc: &mut Scratch, out: &mut [f32], rows: &[u8]| {
         // SAFETY: `Avx2` is only picked by `Backend::detect` after the runtime check
         unsafe {
             match backend {
-                Backend::Scalar => matmul_rows::<Scalar>(sc, out, rows, &acts, tokens),
+                Backend::Scalar => matmul_rows::<Scalar>(format, sc, out, rows, &acts, tokens),
                 #[cfg(target_arch = "x86_64")]
-                Backend::Avx2 => matmul_rows_avx2(sc, out, rows, &acts, tokens),
+                Backend::Avx2 => matmul_rows_avx2(format, sc, out, rows, &acts, tokens),
             }
         }
     };
@@ -500,16 +558,25 @@ mod tests {
         (*state >> 33) as u32
     }
 
-    fn random_blocks(n: usize, seed: u64) -> Vec<u8> {
+    const FORMATS: [PackedFormat; 2] = [PackedFormat::Ptq1_0, PackedFormat::Pq2_0];
+
+    /// Random blocks of `format`; PQ2_0 uses all four codes, PTQ1_0 the three trits.
+    fn random_blocks(format: PackedFormat, n: usize, seed: u64) -> Vec<u8> {
         let mut s = seed;
         let mut bytes = Vec::new();
         for _ in 0..n {
             let mut codes = [0u8; PTQ1_0_BLOCK_ELEMS];
-            codes.iter_mut().for_each(|c| *c = (lcg(&mut s) % 3) as u8);
-            bytes.extend_from_slice(&encode_block(
-                &codes,
-                0.01 + (lcg(&mut s) % 100) as f32 * 1e-4,
-            ));
+            let scale = 0.01 + (lcg(&mut s) % 100) as f32 * 1e-4;
+            match format {
+                PackedFormat::Ptq1_0 => {
+                    codes.iter_mut().for_each(|c| *c = (lcg(&mut s) % 3) as u8);
+                    bytes.extend_from_slice(&encode_block(&codes, scale));
+                }
+                PackedFormat::Pq2_0 => {
+                    codes.iter_mut().for_each(|c| *c = (lcg(&mut s) % 4) as u8);
+                    bytes.extend_from_slice(&pq2_0::encode_block(&codes, scale));
+                }
+            }
         }
         bytes
     }
@@ -520,20 +587,48 @@ mod tests {
         if Backend::detect() != Backend::Avx2 {
             return;
         }
-        for block in random_blocks(64, 3).as_chunks::<PTQ1_0_BLOCK_BYTES>().0 {
+        for block in random_blocks(PackedFormat::Ptq1_0, 64, 3)
+            .as_chunks::<PTQ1_0_BLOCK_BYTES>()
+            .0
+        {
             let mut want = [0u8; PTQ1_0_BLOCK_ELEMS];
             unpack_block_trits(block, &mut want);
             let mut got = [0u8; PTQ1_0_BLOCK_ELEMS];
             // SAFETY: avx2 detected above
-            unsafe { decode_avx2(block, &mut got) };
+            unsafe { decode_ptq1_0_avx2(block, &mut got) };
+            assert_eq!(got, want);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_pq2_0_decode_matches_reference() {
+        if Backend::detect() != Backend::Avx2 {
+            return;
+        }
+        for block in random_blocks(PackedFormat::Pq2_0, 64, 4)
+            .as_chunks::<PQ2_0_BLOCK_BYTES>()
+            .0
+        {
+            let mut want = [0u8; PTQ1_0_BLOCK_ELEMS];
+            pq2_0::unpack_block_codes(block, &mut want);
+            let mut got = [0u8; PTQ1_0_BLOCK_ELEMS];
+            // SAFETY: avx2 detected above
+            unsafe { decode_pq2_0_avx2(block, &mut got) };
             assert_eq!(got, want);
         }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    unsafe fn decode_avx2(block: &[u8; PTQ1_0_BLOCK_BYTES], out: &mut Elems<u8>) {
-        Avx2::decode(block, out)
+    unsafe fn decode_ptq1_0_avx2(block: &[u8; PTQ1_0_BLOCK_BYTES], out: &mut Elems<u8>) {
+        Avx2::decode_ptq1_0(block, out)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn decode_pq2_0_avx2(block: &[u8; PQ2_0_BLOCK_BYTES], out: &mut Elems<u8>) {
+        Avx2::decode_pq2_0(block, out)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -543,17 +638,86 @@ mod tests {
             return;
         }
         let wide = (K_TILE_BLOCKS + 3) * PTQ1_0_BLOCK_ELEMS;
-        for in_dim in [PTQ1_0_BLOCK_ELEMS, wide] {
-            for tokens in [1, 2, TOKEN_BLOCK + 1, TOKEN_TILE + TOKEN_BLOCK + 1] {
-                let out_dim = ROWS_PER_TASK * 2 + 5;
-                let bytes = random_blocks(out_dim * in_dim / PTQ1_0_BLOCK_ELEMS, 11);
-                let mut s = 5u64;
-                let x: Vec<f32> = (0..tokens * in_dim)
-                    .map(|_| (lcg(&mut s) % 2001) as f32 / 1000.0 - 1.0)
-                    .collect();
-                let a = packed_matmul_with(Backend::Scalar, &bytes, out_dim, in_dim, &x, tokens);
-                let b = packed_matmul_with(Backend::Avx2, &bytes, out_dim, in_dim, &x, tokens);
-                assert_eq!(a, b, "in_dim {in_dim} tokens {tokens}");
+        for format in FORMATS {
+            for in_dim in [PTQ1_0_BLOCK_ELEMS, wide] {
+                for tokens in [1, 2, TOKEN_BLOCK + 1, TOKEN_TILE + TOKEN_BLOCK + 1] {
+                    let out_dim = ROWS_PER_TASK * 2 + 5;
+                    let bytes = random_blocks(format, out_dim * in_dim / PTQ1_0_BLOCK_ELEMS, 11);
+                    let mut s = 5u64;
+                    let x: Vec<f32> = (0..tokens * in_dim)
+                        .map(|_| (lcg(&mut s) % 2001) as f32 / 1000.0 - 1.0)
+                        .collect();
+                    let a = packed_matmul_with(
+                        Backend::Scalar,
+                        format,
+                        &bytes,
+                        out_dim,
+                        in_dim,
+                        &x,
+                        tokens,
+                    );
+                    let b = packed_matmul_with(
+                        Backend::Avx2,
+                        format,
+                        &bytes,
+                        out_dim,
+                        in_dim,
+                        &x,
+                        tokens,
+                    );
+                    assert_eq!(a, b, "{format:?} in_dim {in_dim} tokens {tokens}");
+                }
+            }
+        }
+    }
+
+    /// Packed int8 matmul against the float dot of the dequantized rows, for every format and both backends.
+    #[test]
+    fn packed_matmul_matches_dequantized_rows() {
+        const INT8_REL_ERR: f32 = 2e-2;
+        let in_dim = (K_TILE_BLOCKS + 3) * PTQ1_0_BLOCK_ELEMS;
+        let (out_dim, tokens) = (ROWS_PER_TASK + 3, 5);
+        for format in FORMATS {
+            let bytes = random_blocks(format, out_dim * in_dim / PTQ1_0_BLOCK_ELEMS, 21);
+            let mut s = 9u64;
+            let x: Vec<f32> = (0..tokens * in_dim)
+                .map(|_| (lcg(&mut s) % 2001) as f32 / 1000.0 - 1.0)
+                .collect();
+            let mut dense = vec![0f32; out_dim * in_dim];
+            for (row, dst) in bytes
+                .chunks(in_dim / PTQ1_0_BLOCK_ELEMS * format.block_bytes())
+                .zip(dense.chunks_mut(in_dim))
+            {
+                format.dequantize_row(row, dst);
+            }
+            let want: Vec<f32> = (0..tokens)
+                .flat_map(|t| {
+                    let xt = &x[t * in_dim..(t + 1) * in_dim];
+                    dense
+                        .chunks(in_dim)
+                        .map(|w| w.iter().zip(xt).map(|(w, x)| w * x).sum::<f32>())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let norm = want.iter().map(|w| w * w).sum::<f32>().sqrt();
+            let backends = [
+                Backend::Scalar,
+                #[cfg(target_arch = "x86_64")]
+                Backend::detect(),
+            ];
+            for backend in backends {
+                let got = packed_matmul_with(backend, format, &bytes, out_dim, in_dim, &x, tokens);
+                let err = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(g, w)| (g - w).powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                assert!(
+                    err / norm < INT8_REL_ERR,
+                    "{format:?} {backend:?}: rel err {}",
+                    err / norm
+                );
             }
         }
     }

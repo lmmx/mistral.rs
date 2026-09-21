@@ -1,6 +1,7 @@
 //! Prism ternary group-128 codec (ggml type 143): 5 trits/byte in `qs`, 4 trits/byte in `qh`, fp16 scale last.
 //!
-//! The CPU matmul, CUDA path and linear layer built on it are the submodules.
+//! The CPU matmul, CUDA path and linear layer built on it are the submodules. The linear layer and the CPU matmul also run
+//! the 2-bit `PQ2_0` blocks (ggml type 142, see `pq2_0.rs`), which share the group size and the activation handling.
 
 mod cpu;
 #[cfg(feature = "cuda")]
@@ -9,9 +10,11 @@ mod cuda;
 mod ffi;
 mod linear;
 
-pub(super) use linear::Ptq1_0Linear;
+pub(super) use linear::PackedTernaryLinear;
 
 use half::f16;
+
+use super::pq2_0::{self, PQ2_0_BLOCK_BYTES, PQ2_0_GGUF_TYPE};
 
 pub const PTQ1_0_GGUF_TYPE: u32 = 143;
 pub const PTQ1_0_BLOCK_ELEMS: usize = 128;
@@ -23,6 +26,44 @@ const QS_TRITS_PER_BYTE: usize = 5;
 const QH_TRITS_PER_BYTE: usize = 4;
 const QS_STAGES: [usize; 3] = [32, 16, 8];
 const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
+
+/// The packed group-128 storage types that stay block-quantized in memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PackedFormat {
+    Ptq1_0,
+    Pq2_0,
+}
+
+impl PackedFormat {
+    pub(super) fn from_gguf_type(raw: u32) -> Option<Self> {
+        match raw {
+            PTQ1_0_GGUF_TYPE => Some(Self::Ptq1_0),
+            PQ2_0_GGUF_TYPE => Some(Self::Pq2_0),
+            _ => None,
+        }
+    }
+
+    pub(super) const fn block_bytes(self) -> usize {
+        match self {
+            Self::Ptq1_0 => PTQ1_0_BLOCK_BYTES,
+            Self::Pq2_0 => PQ2_0_BLOCK_BYTES,
+        }
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Ptq1_0 => "ptq1_0",
+            Self::Pq2_0 => "pq2_0",
+        }
+    }
+
+    pub(super) fn dequantize_row(self, bytes: &[u8], out: &mut [f32]) {
+        match self {
+            Self::Ptq1_0 => dequantize_row(bytes, out),
+            Self::Pq2_0 => pq2_0::dequantize_row(bytes, out),
+        }
+    }
+}
 
 #[inline(always)]
 pub(super) const fn trit(byte: u8, n: usize) -> u8 {

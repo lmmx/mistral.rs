@@ -12,7 +12,10 @@ use super::{
     archive::{qtensor_from_gguf_data, GgufArchive, GgufEndian},
     hadamard::HadamardSpec,
     pq2_0::{self, PQ2_0_BLOCK_BYTES, PQ2_0_BLOCK_ELEMS, PQ2_0_GGUF_TYPE},
-    ptq1_0::{self, Ptq1_0Linear, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS, PTQ1_0_GGUF_TYPE},
+    ptq1_0::{
+        self, PackedFormat, PackedTernaryLinear, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS,
+        PTQ1_0_GGUF_TYPE,
+    },
     GgufMatMul,
 };
 use crate::{
@@ -356,7 +359,8 @@ impl GgufWeightSource {
         self.packed_ternary = on;
     }
 
-    /// Keeps PTQ1_0 blocks packed (fold applied to activations) for unsharded CPU and CUDA linears.
+    /// Keeps PTQ1_0 and PQ2_0 blocks packed (fold applied to activations) for unsharded linears: PTQ1_0 on CPU and CUDA,
+    /// PQ2_0 on CPU.
     fn try_load_packed_ternary(
         &self,
         key: &str,
@@ -365,9 +369,13 @@ impl GgufWeightSource {
         shard: Shard,
     ) -> Result<Option<Arc<dyn QuantMethod>>> {
         let info = self.archive.tensor_info(source_name)?;
+        let Some(format) = PackedFormat::from_gguf_type(info.dtype().raw()) else {
+            return Ok(None);
+        };
+        let on_supported_device = device.is_cpu()
+            || (cfg!(feature = "cuda") && device.is_cuda() && format == PackedFormat::Ptq1_0);
         if !self.packed_ternary
-            || !(device.is_cpu() || (cfg!(feature = "cuda") && device.is_cuda()))
-            || info.dtype().raw() != PTQ1_0_GGUF_TYPE
+            || !on_supported_device
             || info.shape().len() != 2
             || shard_range(shard, info.shape())?.is_some()
         {
@@ -383,7 +391,8 @@ impl GgufWeightSource {
             return Ok(None);
         }
         let bias = self.load_bias(key, device, None, 2)?;
-        let layer = Ptq1_0Linear::new(
+        let layer = PackedTernaryLinear::new(
+            format,
             self.archive.clone(),
             source_name,
             transform,

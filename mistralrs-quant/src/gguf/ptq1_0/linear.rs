@@ -1,4 +1,5 @@
-//! CPU linear over PTQ1_0 blocks read straight from the GGUF mmap, applying the Hadamard fold to activations.
+//! Linear over packed PTQ1_0 or PQ2_0 blocks read straight from the GGUF mmap (CPU) or uploaded once (CUDA, PTQ1_0),
+//! applying the Hadamard fold to activations.
 
 use std::sync::{atomic::AtomicUsize, Arc};
 
@@ -8,7 +9,7 @@ use rayon::prelude::*;
 
 #[cfg(feature = "cuda")]
 use super::cuda::PackedWeights;
-use super::{cpu::packed_matmul, dequantize_row, PTQ1_0_BLOCK_BYTES, PTQ1_0_BLOCK_ELEMS};
+use super::{cpu::packed_matmul, PackedFormat, PTQ1_0_BLOCK_ELEMS};
 use crate::gguf::{archive::GgufArchive, hadamard::RowTransform};
 use crate::{
     IsqPlanParams, IsqRequest, IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard,
@@ -16,7 +17,8 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub struct Ptq1_0Linear {
+pub struct PackedTernaryLinear {
+    format: PackedFormat,
     archive: Arc<GgufArchive>,
     name: String,
     out_dim: usize,
@@ -29,8 +31,9 @@ pub struct Ptq1_0Linear {
     gpu: Option<PackedWeights>,
 }
 
-impl Ptq1_0Linear {
+impl PackedTernaryLinear {
     pub fn new(
+        format: PackedFormat,
         archive: Arc<GgufArchive>,
         name: &str,
         transform: Option<RowTransform>,
@@ -40,10 +43,15 @@ impl Ptq1_0Linear {
     ) -> Result<Self> {
         let shape = archive.tensor_info(name)?.shape().to_vec();
         let &[out_dim, in_dim] = shape.as_slice() else {
-            candle_core::bail!("PTQ1_0 linear `{name}` must be rank 2, got {shape:?}");
+            candle_core::bail!("{format:?} linear `{name}` must be rank 2, got {shape:?}");
         };
         if !in_dim.is_multiple_of(PTQ1_0_BLOCK_ELEMS) {
-            candle_core::bail!("PTQ1_0 linear `{name}` width {in_dim} is not a multiple of 128");
+            candle_core::bail!(
+                "{format:?} linear `{name}` width {in_dim} is not a multiple of 128"
+            );
+        }
+        if device.is_cuda() && format != PackedFormat::Ptq1_0 {
+            candle_core::bail!("{format:?} linear `{name}` has no CUDA kernel yet");
         }
         #[cfg(feature = "cuda")]
         let gpu = if device.is_cuda() {
@@ -55,10 +63,11 @@ impl Ptq1_0Linear {
         #[cfg(not(feature = "cuda"))]
         if !device.is_cpu() {
             candle_core::bail!(
-                "PTQ1_0 packed linear `{name}` needs the cuda feature for {device:?}"
+                "{format:?} packed linear `{name}` needs the cuda feature for {device:?}"
             );
         }
         Ok(Self {
+            format,
             archive,
             name: name.to_string(),
             out_dim,
@@ -73,7 +82,7 @@ impl Ptq1_0Linear {
     }
 
     fn row_bytes(&self) -> usize {
-        self.in_dim / PTQ1_0_BLOCK_ELEMS * PTQ1_0_BLOCK_BYTES
+        self.in_dim / PTQ1_0_BLOCK_ELEMS * self.format.block_bytes()
     }
 
     fn weight_bytes(&self) -> Result<&[u8]> {
@@ -82,18 +91,18 @@ impl Ptq1_0Linear {
 
     fn require_cpu(tensor: &Tensor) -> Result<()> {
         if !tensor.device().is_cpu() {
-            candle_core::bail!("PTQ1_0 packed linear only runs on CPU activations");
+            candle_core::bail!("packed ternary linear only runs on CPU activations");
         }
         Ok(())
     }
 }
 
-impl QuantMethod for Ptq1_0Linear {
+impl QuantMethod for PackedTernaryLinear {
     fn new(_method: QuantMethodConfig) -> Result<Self>
     where
         Self: Sized,
     {
-        candle_core::bail!("PTQ1_0 linears are only built from a GGUF archive")
+        candle_core::bail!("packed ternary linears are only built from a GGUF archive")
     }
 
     fn dequantize_w(&self) -> Result<Tensor> {
@@ -101,7 +110,7 @@ impl QuantMethod for Ptq1_0Linear {
         let row_bytes = self.row_bytes();
         data.par_chunks_mut(self.in_dim)
             .zip(self.weight_bytes()?.par_chunks(row_bytes))
-            .for_each(|(dst, src)| dequantize_row(src, dst));
+            .for_each(|(dst, src)| self.format.dequantize_row(src, dst));
         if let Some(transform) = &self.transform {
             transform.unfold_weight(&mut data);
         }
@@ -126,13 +135,18 @@ impl QuantMethod for Ptq1_0Linear {
             .is_some_and(RowTransform::is_inverse)
         {
             candle_core::bail!(
-                "PTQ1_0 linear `{}`: inverse-role tensors only support embedding lookups",
+                "{:?} linear `{}`: inverse-role tensors only support embedding lookups",
+                self.format,
                 self.name
             );
         }
         let dims = a.dims().to_vec();
         if dims.last() != Some(&self.in_dim) {
-            candle_core::bail!("PTQ1_0 linear `{}` got input shape {dims:?}", self.name);
+            candle_core::bail!(
+                "{:?} linear `{}` got input shape {dims:?}",
+                self.format,
+                self.name
+            );
         }
         let tokens = a.elem_count() / self.in_dim;
         let mut xt = a
@@ -144,7 +158,14 @@ impl QuantMethod for Ptq1_0Linear {
             xt.par_chunks_mut(self.in_dim)
                 .for_each_init(Vec::new, |scratch, row| transform.apply(row, scratch));
         }
-        let y = packed_matmul(self.weight_bytes()?, self.out_dim, self.in_dim, &xt, tokens);
+        let y = packed_matmul(
+            self.format,
+            self.weight_bytes()?,
+            self.out_dim,
+            self.in_dim,
+            &xt,
+            tokens,
+        );
         let mut y = Tensor::from_vec(y, (tokens, self.out_dim), &Device::Cpu)?;
         if let Some(bias) = &self.bias {
             y = y.broadcast_add(&bias.to_dtype(DType::F32)?)?;
@@ -169,7 +190,8 @@ impl QuantMethod for Ptq1_0Linear {
             .zip(flat.par_iter())
             .for_each_init(Vec::new, |scratch, (dst, id)| {
                 let start = *id as usize * row_bytes;
-                dequantize_row(&bytes[start..start + row_bytes], dst);
+                self.format
+                    .dequantize_row(&bytes[start..start + row_bytes], dst);
                 if let Some(transform) = &self.transform {
                     transform.apply(dst, scratch);
                 }
@@ -198,7 +220,7 @@ impl QuantMethod for Ptq1_0Linear {
     }
 
     fn add_delta_w(&self, _delta: &Tensor) -> Result<Arc<dyn QuantMethod>> {
-        candle_core::bail!("PTQ1_0 packed linear does not support LoRA deltas")
+        candle_core::bail!("packed ternary linear does not support LoRA deltas")
     }
 
     fn apply_isq(
@@ -221,9 +243,9 @@ impl QuantMethod for Ptq1_0Linear {
     }
 }
 
-impl QuantizedSerde for Ptq1_0Linear {
+impl QuantizedSerde for PackedTernaryLinear {
     fn name(&self) -> &'static str {
-        "ptq1_0"
+        self.format.name()
     }
 }
 
@@ -237,7 +259,7 @@ mod tests {
     };
     #[cfg(feature = "cuda")]
     use crate::gguf::hadamard::HadamardRole;
-    use crate::gguf::ptq1_0::encode_block;
+    use crate::gguf::ptq1_0::{dequantize_row, encode_block, PTQ1_0_BLOCK_BYTES};
 
     const INT8_REL_ERR: f32 = 2e-2; // int8 activations, one scale per 128 columns
     const LCG_MUL: u64 = 6364136223846793005;
@@ -283,7 +305,7 @@ mod tests {
         w.chunks_mut(in_dim)
             .zip(bytes.chunks(in_dim / PTQ1_0_BLOCK_ELEMS * PTQ1_0_BLOCK_BYTES))
             .for_each(|(d, s)| dequantize_row(s, d));
-        let got = packed_matmul(&bytes, out_dim, in_dim, &x, tokens);
+        let got = packed_matmul(PackedFormat::Ptq1_0, &bytes, out_dim, in_dim, &x, tokens);
         let (mut err, mut norm) = (0f32, 0f32);
         for t in 0..tokens {
             for r in 0..out_dim {
@@ -314,11 +336,18 @@ mod tests {
             (40960, 17408, 1),
         ] {
             let (bytes, x) = synthetic(out_dim, in_dim, tokens);
-            packed_matmul(&bytes, out_dim, in_dim, &x, tokens);
+            packed_matmul(PackedFormat::Ptq1_0, &bytes, out_dim, in_dim, &x, tokens);
             let start = Instant::now();
             let reps = 5;
             for _ in 0..reps {
-                std::hint::black_box(packed_matmul(&bytes, out_dim, in_dim, &x, tokens));
+                std::hint::black_box(packed_matmul(
+                    PackedFormat::Ptq1_0,
+                    &bytes,
+                    out_dim,
+                    in_dim,
+                    &x,
+                    tokens,
+                ));
             }
             let secs = start.elapsed().as_secs_f64() / reps as f64;
             let gbps = bytes.len() as f64 / secs / 1e9;
@@ -332,11 +361,18 @@ mod tests {
         let path = std::env::temp_dir().join("ptq1_0_speed.bin");
         std::fs::write(&path, &bytes).unwrap();
         let map = unsafe { memmap2::Mmap::map(&std::fs::File::open(&path).unwrap()).unwrap() };
-        packed_matmul(&map, out_dim, in_dim, &x, 1);
+        packed_matmul(PackedFormat::Ptq1_0, &map, out_dim, in_dim, &x, 1);
         let start = Instant::now();
         let reps = 5;
         for _ in 0..reps {
-            std::hint::black_box(packed_matmul(&map, out_dim, in_dim, &x, 1));
+            std::hint::black_box(packed_matmul(
+                PackedFormat::Ptq1_0,
+                &map,
+                out_dim,
+                in_dim,
+                &x,
+                1,
+            ));
         }
         let secs = start.elapsed().as_secs_f64() / reps as f64;
         eprintln!(
@@ -363,13 +399,20 @@ mod tests {
     fn packed_matmul_gap_overhead() {
         let (out_dim, in_dim) = (5120, 17408);
         let (bytes, x) = synthetic(out_dim, in_dim, 1);
-        packed_matmul(&bytes, out_dim, in_dim, &x, 1);
+        packed_matmul(PackedFormat::Ptq1_0, &bytes, out_dim, in_dim, &x, 1);
         for gap_us in [0u64, 20, 100, 300] {
             let reps = 200;
             let mut busy = std::time::Duration::ZERO;
             for _ in 0..reps {
                 let start = Instant::now();
-                std::hint::black_box(packed_matmul(&bytes, out_dim, in_dim, &x, 1));
+                std::hint::black_box(packed_matmul(
+                    PackedFormat::Ptq1_0,
+                    &bytes,
+                    out_dim,
+                    in_dim,
+                    &x,
+                    1,
+                ));
                 busy += start.elapsed();
                 let gap = Instant::now();
                 while gap.elapsed() < std::time::Duration::from_micros(gap_us) {
@@ -419,7 +462,8 @@ mod tests {
                     xt.chunks_mut(in_dim)
                         .for_each(|row| transform.apply(row, &mut Vec::new()));
                 }
-                let want = packed_matmul(&bytes, out_dim, in_dim, &xt, tokens);
+                let want =
+                    packed_matmul(PackedFormat::Ptq1_0, &bytes, out_dim, in_dim, &xt, tokens);
                 let got = gpu
                     .matmul(&input, out_dim, in_dim)?
                     .to_dtype(DType::F32)?
